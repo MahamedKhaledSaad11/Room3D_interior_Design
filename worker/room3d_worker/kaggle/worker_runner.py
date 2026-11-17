@@ -78,7 +78,6 @@ def _cell_02_install_deps(repo_url: str | None) -> dict[str, Any]:
     effective_repo = repo_url or DEFAULT_REPO_URL
     return _cell(
         f'''# Cell 2: Install Apache-2.0/MIT/BSD Stack, Sync Repo & Discover Datasets
-import importlib
 import json
 import os
 import subprocess
@@ -87,7 +86,9 @@ from pathlib import Path
 
 REPO_URL = {json.dumps(effective_repo)}
 REPO_DIR = Path("/kaggle/working/room3d")
+NUMPY_PIN = "numpy>=2.1.0,<2.3"
 PINNED_PACKAGES = [
+    NUMPY_PIN,
     "av>=12.0.0",
     "pycolmap-cuda12==4.2.1",
     "gsplat>=1.4.0",
@@ -113,6 +114,11 @@ subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q", "git+https://github.com/facebookresearch/vggt.git"],
     check=False,
 )
+# Re-enforce NumPy 2.x after git-based installs so Python 3.13 C-extension ABIs never hit numpy 1.x downgrade.
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--force-reinstall", NUMPY_PIN],
+    check=True,
+)
 os.environ.setdefault("ROOM3D_VGGT_MODEL", "facebook/VGGT-1B")
 if not REPO_DIR.exists():
     subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
@@ -124,8 +130,15 @@ if (REPO_DIR / "worker" / "pyproject.toml").exists():
 if str(REPO_DIR / "worker") not in sys.path:
     sys.path.insert(0, str(REPO_DIR / "worker"))
 
+# Verify imports inside a fresh subprocess so pre-cached sys.modules in the notebook kernel do not conflict.
+VERIFY_CODE = """
+import importlib, numpy as np
+assert int(np.__version__.split(".")[0]) >= 2, "Expected numpy>=2.1.0,<2.3, got " + np.__version__
 for mod in ("av", "pycolmap", "gsplat", "diffusers", "transformers", "accelerate", "sam2"):
     importlib.import_module(mod)
+print("Verified runtime stack in clean subprocess (numpy=" + np.__version__ + ")")
+"""
+subprocess.run([sys.executable, "-c", VERIFY_CODE], check=True)
 
 DB_SCENES = {{}}
 for root in (Path("/kaggle/input"), REPO_DIR / "db"):
