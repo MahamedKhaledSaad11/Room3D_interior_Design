@@ -77,7 +77,8 @@ print(json.dumps(topology, indent=2))
 def _cell_02_install_deps(repo_url: str | None) -> dict[str, Any]:
     effective_repo = repo_url or DEFAULT_REPO_URL
     return _cell(
-        f'''# Cell 2: Install Apache-2.0/MIT/BSD Stack, Sync Repo & Discover Datasets
+        f'''# Cell 2: Install Apache-2.0/MIT/BSD Stack (Protect Pre-installed Torch/CUDA/NumPy)
+from importlib import metadata as _meta
 import json
 import os
 import subprocess
@@ -87,38 +88,68 @@ from pathlib import Path
 REPO_URL = {json.dumps(effective_repo)}
 REPO_DIR = Path("/kaggle/working/room3d")
 NUMPY_PIN = "numpy>=2.1.0,<2.3"
+CONSTRAINTS_PATH = Path("/tmp/kaggle_constraints.txt")
+
+# 1. Snapshot Kaggle's pre-installed PyTorch/CUDA/NCCL stack so pip never overwrites libtorch_cuda.so.
+_protected_names = {{"torch", "torchvision", "torchaudio", "triton"}}
+_protected_prefixes = ("nvidia-", "cuda-")
+constraints = []
+for _dist in _meta.distributions():
+    _name = (_dist.metadata.get("Name") or "").lower()
+    if _name in _protected_names or _name.startswith(_protected_prefixes):
+        constraints.append(f"{{_name}}=={{_dist.version}}")
+constraints = sorted(set(constraints)) + [NUMPY_PIN]
+CONSTRAINTS_PATH.write_text("\\n".join(constraints) + "\\n", encoding="utf-8")
+print(f"Protected {{len(constraints) - 1}} pre-installed torch/CUDA packages in {{CONSTRAINTS_PATH}}")
+
+# 2. Install lightweight runtime dependencies against constraints (preserving torch & numpy>=2.1).
 PINNED_PACKAGES = [
     NUMPY_PIN,
+    "huggingface_hub",
+    "einops",
+    "omegaconf",
+    "hydra-core",
+    "iopath",
+    "safetensors",
+    "timm",
     "av>=12.0.0",
-    "pycolmap-cuda12==4.2.1",
-    "gsplat>=1.4.0",
+    "pycolmap",
     "diffusers>=0.32.0",
     "transformers>=4.46.0",
     "accelerate>=1.0.0",
     "bitsandbytes>=0.45.0",
     "optimum-quanto>=0.2.5",
     "scipy>=1.13.0",
+    "plyfile",
     "pydantic>=2.7",
     "httpx>=0.27.0",
     "Pillow>=10.3.0",
     "opencv-python-headless>=4.10.0",
     "xxhash>=3.4.0",
     "matplotlib>=3.8.0",
+    "ninja",
+    "jaxtyping",
+    "rich",
 ]
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", *PINNED_PACKAGES], check=True)
 subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "git+https://github.com/facebookresearch/sam2.git"],
+    [sys.executable, "-m", "pip", "install", "-q", "-c", str(CONSTRAINTS_PATH), *PINNED_PACKAGES],
+    check=True,
+)
+
+# 3. Install sam2, vggt, and gsplat with --no-deps so they never downgrade torch or numpy.
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "git+https://github.com/facebookresearch/sam2.git"],
     check=True,
 )
 subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "git+https://github.com/facebookresearch/vggt.git"],
+    [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "git+https://github.com/facebookresearch/vggt.git"],
     check=False,
 )
-# Re-enforce NumPy 2.x after git-based installs so Python 3.13 C-extension ABIs never hit numpy 1.x downgrade.
 subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "--force-reinstall", NUMPY_PIN],
+    [sys.executable, "-m", "pip", "install", "-q", "-c", str(CONSTRAINTS_PATH), "--no-build-isolation", "--no-deps", "gsplat>=1.4.0"],
     check=True,
 )
+
 os.environ.setdefault("ROOM3D_VGGT_MODEL", "facebook/VGGT-1B")
 if not REPO_DIR.exists():
     subprocess.run(["git", "clone", "--depth", "1", REPO_URL, str(REPO_DIR)], check=True)
@@ -130,13 +161,14 @@ if (REPO_DIR / "worker" / "pyproject.toml").exists():
 if str(REPO_DIR / "worker") not in sys.path:
     sys.path.insert(0, str(REPO_DIR / "worker"))
 
-# Verify imports inside a fresh subprocess so pre-cached sys.modules in the notebook kernel do not conflict.
+# 4. Verify imports inside a fresh subprocess so pre-cached sys.modules in the notebook kernel do not conflict.
 VERIFY_CODE = """
-import importlib, numpy as np
+import importlib, numpy as np, torch
 assert int(np.__version__.split(".")[0]) >= 2, "Expected numpy>=2.1.0,<2.3, got " + np.__version__
+assert torch.cuda.is_available(), "CUDA must remain available with Kaggle's pre-installed torch"
 for mod in ("av", "pycolmap", "gsplat", "diffusers", "transformers", "accelerate", "sam2"):
     importlib.import_module(mod)
-print("Verified runtime stack in clean subprocess (numpy=" + np.__version__ + ")")
+print("Verified runtime stack (torch=" + torch.__version__ + ", numpy=" + np.__version__ + ")")
 """
 subprocess.run([sys.executable, "-c", VERIFY_CODE], check=True)
 
