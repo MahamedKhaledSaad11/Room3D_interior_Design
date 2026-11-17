@@ -90,7 +90,21 @@ def filter_floaters(points_xyz: np.ndarray, opacity: np.ndarray, scales: np.ndar
         raise ValueError("points, opacity, and scales must have the same Gaussian count") from exc
     finite = np.isfinite(points).all(1) & np.isfinite(alpha) & np.isfinite(size).all(1)
     radius = np.linalg.norm(size, axis=1)
-    return finite & (alpha >= 0.01) & (alpha <= 1.0) & (radius >= 1e-5) & (radius <= 10.0)
+    keep = finite & (alpha >= 0.01) & (alpha <= 1.0) & (radius >= 1e-5) & (radius <= 10.0)
+    return keep & _spatial_inlier_mask(points, keep)
+
+
+def _spatial_inlier_mask(points: ArrayF32, candidates: NDArray[np.bool_]) -> NDArray[np.bool_]:
+    # MCMC can relocate otherwise valid splats far away; exclude them from the radius estimate.
+    bounded = candidates & (np.abs(points) < 1024.0).all(axis=1)
+    if not bounded.any():
+        return bounded
+    positions = points[bounded].astype(np.float64)
+    center = np.median(positions, axis=0)
+    distances = np.linalg.norm(positions - center, axis=1)
+    scene_radius = max(float(np.median(distances)), 1e-6)
+    bounded[bounded] = distances <= 50.0 * scene_radius
+    return bounded
 
 
 def _log_scales(scales: ArrayF32) -> ArrayF32:
@@ -145,11 +159,19 @@ def _to_u8(values: NDArray[Any]) -> ArrayU8:
     return np.clip(np.rint(values), 0, 255).astype(np.uint8)
 
 
-def _pack_positions(points: ArrayF32) -> bytes:
-    limit = (1 << 23) - 1
-    fixed = np.rint(points.astype(np.float64) * (1 << SPZ_FRACTIONAL_BITS)).astype(np.int64)
-    if np.abs(fixed).max(initial=0) > limit:
-        raise GeometryError("positions exceed the SPZ 24-bit fixed-point range (|x| < 2048 at 12 bits)")
+def _position_fractional_bits(points: ArrayF32) -> int:
+    if not np.isfinite(points).all():
+        raise GeometryError("SPZ positions must be finite; remove NaN/Inf coordinates before export")
+    extrema = np.array([points.min(initial=0), points.max(initial=0)], dtype=np.float64)
+    for fractional_bits in range(SPZ_FRACTIONAL_BITS, -1, -1):
+        fixed = np.rint(extrema * (1 << fractional_bits))
+        if fixed[0] >= -(1 << 23) and fixed[1] <= (1 << 23) - 1:
+            return fractional_bits
+    raise GeometryError("positions exceed the SPZ signed 24-bit range even at 0 fractional bits; prune outliers")
+
+
+def _pack_positions(points: ArrayF32, fractional_bits: int) -> bytes:
+    fixed = np.rint(points.astype(np.float64) * (1 << fractional_bits)).astype(np.int64)
     as_u32 = (fixed & 0xFFFFFF).astype("<u4").reshape(-1, 1).view(np.uint8)
     return as_u32[:, :3].tobytes()
 
@@ -162,12 +184,13 @@ def _pack_rotations(quats: ArrayF32) -> bytes:
 
 def pack_spz_v2(splats: SplatArrays) -> bytes:
     """Encode an uncompressed SPZ v2 payload (shDegree 0) per nianticlabs/spz."""
-    header = struct.pack("<IIIBBBB", SPZ_MAGIC, SPZ_VERSION, len(splats.points), 0, SPZ_FRACTIONAL_BITS, 0, 0)
+    fractional_bits = _position_fractional_bits(splats.points)
+    header = struct.pack("<IIIBBBB", SPZ_MAGIC, SPZ_VERSION, len(splats.points), 0, fractional_bits, 0, 0)
     alphas = _to_u8(splats.opacity * 255.0)
     colors = _to_u8(_sh_dc(splats.colors) * (SPZ_COLOR_SCALE * 255.0) + 127.5)
     scales = _to_u8((_log_scales(splats.scales) + 10.0) * 16.0)
     return b"".join(
-        (header, _pack_positions(splats.points), alphas.tobytes(), colors.tobytes(), scales.tobytes(),
+        (header, _pack_positions(splats.points, fractional_bits), alphas.tobytes(), colors.tobytes(), scales.tobytes(),
          _pack_rotations(splats.quats))
     )
 
