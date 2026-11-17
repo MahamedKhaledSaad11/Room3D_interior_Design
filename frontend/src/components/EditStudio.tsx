@@ -125,11 +125,11 @@ export default function EditStudio({
   onJumpToFrame,
 }: EditStudioProps) {
   const [editMode, setEditMode] = useState(false);
-  const [selectionMode, setSelectionMode] = useState<"3d" | "2d">("3d");
-  const [pickerFrameIdx, setPickerFrameIdx] = useState<number>(0);
+  const [preferredSelectionMode, setSelectionMode] = useState<"3d" | "2d">("3d");
+  const [requestedPickerFrameIdx, setPickerFrameIdx] = useState<number>(0);
   const [editId, setEditId] = useState<string | null>(null);
   const [editSession, setEditSession] = useState<EditSession | null>(null);
-  const [baseManifest, setBaseManifest] = useState<Manifest | null>(null);
+  const [baseManifest, setBaseManifest] = useState<{ versionId: string; data: Manifest } | null>(null);
   const [pollingEdit, setPollingEdit] = useState(false);
   const [initialRefFrameIdx, setInitialRefFrameIdx] = useState<number>(0);
   const [refFrameIdx, setRefFrameIdx] = useState<number>(0);
@@ -148,7 +148,8 @@ export default function EditStudio({
   const [error, setError] = useState("");
 
   const editManifest = useMemo(
-    () => (editSession?.base_version_id && editSession.base_version_id !== activeVersionId ? baseManifest : undefined) ?? manifest,
+    () => (editSession?.base_version_id && editSession.base_version_id !== activeVersionId
+      && baseManifest?.versionId === editSession.base_version_id ? baseManifest.data : undefined) ?? manifest,
     [activeVersionId, baseManifest, editSession?.base_version_id, manifest],
   );
   const viewerUnexcludedFrames = useMemo(() => unexcludedFramesFrom(manifest), [manifest]);
@@ -156,35 +157,28 @@ export default function EditStudio({
   const frames = useMemo(() => registeredFramesFrom(manifest), [manifest]);
   const pickerFrames = useMemo(() => (frames.length > 0 ? frames : viewerUnexcludedFrames), [frames, viewerUnexcludedFrames]);
 
-  useEffect(() => {
-    if (frames.length === 0 && viewerUnexcludedFrames.length > 0) {
-      setSelectionMode("2d");
-    }
-  }, [frames.length, viewerUnexcludedFrames.length]);
+  const selectionMode = frames.length === 0 && viewerUnexcludedFrames.length > 0 ? "2d" : preferredSelectionMode;
+  const pickerFrameIdx = pickerFrames.some((frame) => frame.frame_idx === requestedPickerFrameIdx)
+    ? requestedPickerFrameIdx : pickerFrames[0]?.frame_idx ?? 0;
 
   useEffect(() => {
     const baseVersionId = editSession?.base_version_id;
     if (!baseVersionId || baseVersionId === activeVersionId) {
-      setBaseManifest(null);
       return;
     }
     let cancelled = false;
     void roomApi
       .manifest(projectId, baseVersionId)
       .then((data) => {
-        if (!cancelled) setBaseManifest(data);
+        if (!cancelled) setBaseManifest({ versionId: baseVersionId, data });
       })
-      .catch(() => undefined);
+      .catch((reason: unknown) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "Unable to load the original scene.");
+      });
     return () => {
       cancelled = true;
     };
   }, [activeVersionId, editSession?.base_version_id, projectId]);
-
-  useEffect(() => {
-    if (pickerFrames.length > 0 && !pickerFrames.some((f) => f.frame_idx === pickerFrameIdx)) {
-      setPickerFrameIdx(pickerFrames[0]!.frame_idx);
-    }
-  }, [pickerFrames, pickerFrameIdx]);
 
   const loadFrames = useCallback(async (targetEditId: string, page = 1) => {
     const data = await roomApi.editFrames(targetEditId, page);
@@ -266,17 +260,22 @@ export default function EditStudio({
           const matched = resolveSeedKey(previewMap, chosenSeed);
           setChosenSeed(matched ?? seeds[0]!);
         }
-        await loadFrames(editId, framesData?.page ?? 1).catch(() => undefined);
+        await loadFrames(editId, framesData?.page ?? 1);
         if (latest.status && !ACTIVE_EDIT_STATUSES.has(latest.status)) {
           setPollingEdit(false);
           if (latest.status === "completed") {
-            void onRefreshProject().catch(() => undefined);
+            await onRefreshProject();
+            if (latest.target_version_id) {
+              onSelectVersion(latest.target_version_id);
+              setStatusMessage("Rebuild complete. Compare Before and After below.");
+            }
           }
         }
-      } catch {
-        // Keep background polling non-fatal when endpoint or mock is absent.
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "Unable to refresh edit progress.");
       }
     };
+    void pollOnce();
     const timer = window.setInterval(() => {
       void pollOnce();
     }, 2000);
@@ -284,7 +283,7 @@ export default function EditStudio({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [chosenSeed, editId, framesData?.page, loadFrames, pollingEdit, projectId]);
+  }, [chosenSeed, editId, framesData?.page, loadFrames, pollingEdit, projectId, onRefreshProject, onSelectVersion]);
 
   const handlePickerImageClick = (event: React.MouseEvent<HTMLDivElement>) => {
     if (busy) return;
@@ -314,7 +313,7 @@ export default function EditStudio({
     if (!editId) return;
     await runAction(async () => {
       await (refFrameIdx !== initialRefFrameIdx
-        ? roomApi.refine(editId, [pt], refFrameIdx)
+        ? roomApi.refine(editId, [...points, pt], refFrameIdx)
         : roomApi.refine(editId, [pt]));
       setPoints((prev) => [...prev, pt]);
       setEditSession((prev) => (prev ? { ...prev, preview_seeds: {} } : prev));
@@ -344,12 +343,8 @@ export default function EditStudio({
     setMaskRevision((v) => v + 1);
     setEditSession((prev) => (prev ? { ...prev, preview_seeds: {} } : prev));
     await loadFrames(targetEditId, framesData?.page ?? 1);
-    try {
-      const latest = await roomApi.getEdit(projectId, targetEditId);
-      if (latest) setEditSession(latest);
-    } catch {
-      // Non-fatal if getEdit is unmocked in isolated unit tests.
-    }
+    const latest = await roomApi.getEdit(projectId, targetEditId);
+    if (latest) setEditSession(latest);
   };
 
   const handleToggleSkip = async (frameIdx: number, skip: boolean) => {
@@ -541,7 +536,6 @@ export default function EditStudio({
             style={{ position: "relative", width: "100%", aspectRatio: `${pickerWidth}/${pickerHeight}`, background: "#0b1220", borderRadius: "6px", overflow: "hidden", cursor: "crosshair" }}
           >
             {pickerImageUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
               <img src={pickerImageUrl} alt={`Frame ${pickerFrameIdx}`} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
             ) : (
               <span style={{ padding: "12px", display: "block", fontSize: "12px" }}>Click to select Frame #{pickerFrameIdx}</span>
@@ -581,6 +575,15 @@ export default function EditStudio({
               </button>
             );
           })}
+        </div>
+      ) : null}
+
+      {editSession?.status === "completed" && editSession.base_version_id && editSession.target_version_id ? (
+        <div role="group" aria-label="Before / After">
+          {[["Before", editSession.base_version_id], ["After", editSession.target_version_id]].map(([label, version]) => (
+            <button key={label} type="button" aria-pressed={activeVersionId === version}
+              onClick={() => onSelectVersion(version!)}>{label}</button>
+          ))}
         </div>
       ) : null}
 

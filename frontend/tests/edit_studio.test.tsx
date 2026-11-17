@@ -2,7 +2,7 @@ import React from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import EditStudio from "@/components/EditStudio";
-import { roomApi, type ProjectDetail, type ViewerClickEvent, type ViewerController } from "@/lib/api";
+import { roomApi, type EditSession, type ProjectDetail, type ViewerClickEvent, type ViewerController } from "@/lib/api";
 
 describe("EditStudio interactive Week 2 workflow", () => {
   let clickCallback: ((ev: ViewerClickEvent) => void) | null = null;
@@ -39,6 +39,8 @@ describe("EditStudio interactive Week 2 workflow", () => {
   });
 
   it("drives click resolve -> refine -> track -> skip/mask upload -> seed preview -> apply -> version switch", async () => {
+    let latest: EditSession = { id: "edit-1234", status: "segmented", base_version_id: "v1", ref_frame_idx: 2 };
+    vi.spyOn(roomApi, "getEdit").mockImplementation(async () => latest);
     vi.spyOn(roomApi, "resolveClick").mockResolvedValue({
       edit_id: "edit-1234",
       ref_frame_idx: 2,
@@ -66,8 +68,15 @@ describe("EditStudio interactive Week 2 workflow", () => {
       status: "skipped",
       skip_frame: true,
     });
-    const previewSpy = vi.spyOn(roomApi, "previewSeeds").mockResolvedValue({ id: "t-prev", type: "diffusion_preview", status: "queued", progress_pct: 0 });
-    const applySpy = vi.spyOn(roomApi, "applyEdit").mockResolvedValue({
+    const previewSpy = vi.spyOn(roomApi, "previewSeeds").mockImplementation(async () => {
+      latest = { ...latest, status: "preview_ready", preview_seeds: Object.fromEntries(
+        [101, 202, 303, 404].map((seed) => [String(seed), `proj-w2/edits/edit-1234/seed_previews/${seed}.png`]),
+      ) };
+      return { id: "t-prev", type: "diffusion_preview", status: "queued", progress_pct: 0 };
+    });
+    const applySpy = vi.spyOn(roomApi, "applyEdit").mockImplementation(async () => {
+      latest = { ...latest, status: "rebuilding", target_version_id: "v2" };
+      return {
       id: "t-reb",
       type: "rebuild_week2",
       status: "queued",
@@ -75,6 +84,7 @@ describe("EditStudio interactive Week 2 workflow", () => {
       edit_id: "edit-1234",
       target_version_id: "v2",
       diffusion_task_id: "t-diff",
+      };
     });
 
     const onSelectVersion = vi.fn();
@@ -127,15 +137,23 @@ describe("EditStudio interactive Week 2 workflow", () => {
 
     fireEvent.change(screen.getByLabelText("Edit instruction prompt"), { target: { value: "emerald armchair" } });
     fireEvent.click(screen.getByRole("button", { name: "Generate Seed Previews" }));
-    await waitFor(() => expect(previewSpy).toHaveBeenCalledWith("edit-1234", "emerald armchair", [101, 202, 303], "flux2_klein_4b"));
+    await waitFor(() => expect(previewSpy).toHaveBeenCalledWith("edit-1234", "emerald armchair", [101, 202, 303, 404], "flux2_klein_4b", undefined));
+    await waitFor(() => expect(screen.getAllByRole("img", { name: /Preview for/ })).toHaveLength(4));
+    fireEvent.click(screen.getByRole("button", { name: "Select seed 202" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Apply & Rebuild 3D Room" }));
-    await waitFor(() => expect(applySpy).toHaveBeenCalledWith("edit-1234", "seed_101", "masked_finetune", "emerald armchair"));
+    await waitFor(() => expect(applySpy).toHaveBeenCalledWith("edit-1234", "202", "masked_finetune", "emerald armchair"));
     await waitFor(() => expect(screen.getByText(/Rebuild queued for version v2/i)).toBeInTheDocument());
     expect(onRefreshProject).toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "V2 Velvet Chair" }));
     expect(onSelectVersion).toHaveBeenCalledWith("v2");
     expect(controller.setActiveVersion).toHaveBeenCalledWith("v2");
+    latest = { ...latest, status: "completed" };
+    await waitFor(() => expect(screen.getByRole("group", { name: "Before / After" })).toBeInTheDocument(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("button", { name: /^Before$/ }));
+    expect(onSelectVersion).toHaveBeenLastCalledWith("v1");
+    fireEvent.click(screen.getByRole("button", { name: /^After$/ }));
+    expect(onSelectVersion).toHaveBeenLastCalledWith("v2");
   });
 });

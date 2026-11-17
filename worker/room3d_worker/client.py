@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator
@@ -16,6 +20,10 @@ class WorkerClientError(RuntimeError):
 
 class StaleAttemptError(WorkerClientError):
     """The task attempt fence no longer belongs to this worker."""
+
+
+class RetryableWorkerError(WorkerClientError):
+    """A transport interruption or temporary upstream failure can be retried."""
 
 
 @dataclass(frozen=True)
@@ -57,6 +65,10 @@ class WorkerClient:
         "pose_benchmark": "cuda:1",
         "track_propagate": "cuda:1",
         "rebuild_week2": "cuda:1",
+        "reconstruct": "cuda:1",
+        "segment_track": "cuda:1",
+        "diffusion_propagate": "cuda:0",
+        "rebuild": "cuda:1",
     }
     INTERACTIVE_TASKS = {"segment_init", "segment_refine"}
 
@@ -67,7 +79,15 @@ class WorkerClient:
         *,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 30.0,
+        upload_chunk_bytes: int = 8 * 1024 * 1024,
+        upload_attempts: int = 4,
+        retry_delay: float = 1.0,
     ) -> None:
+        if upload_chunk_bytes <= 0 or upload_attempts < 1 or retry_delay < 0:
+            raise ValueError("Upload chunk size and attempts must be positive; delay must be non-negative")
+        self._upload_chunk_bytes = upload_chunk_bytes
+        self._upload_attempts = upload_attempts
+        self._retry_delay = retry_delay
         headers = {"X-Worker-Token": worker_token, "Accept": "application/json"}
         self._http = httpx.Client(
             base_url=base_url.rstrip("/"), headers=headers, timeout=timeout, transport=transport
@@ -83,9 +103,14 @@ class WorkerClient:
         self.close()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        response = self._http.request(method, path, **kwargs)
+        try:
+            response = self._http.request(method, path, **kwargs)
+        except httpx.TransportError as exc:
+            raise RetryableWorkerError(f"Backend {method} {path} transport failed: {exc}") from exc
         if response.status_code == 409:
             raise StaleAttemptError(f"Backend rejected stale attempt for {path}")
+        if response.status_code in {408, 429} or response.status_code >= 500:
+            raise RetryableWorkerError(f"Backend {method} {path} temporarily failed: {response.status_code}")
         if response.status_code >= 400:
             raise WorkerClientError(
                 f"Backend {method} {path} failed with {response.status_code}: {response.text}"
@@ -97,7 +122,7 @@ class WorkerClient:
     def claim(
         self, worker_id: str, capabilities: list[str], *, interactive_only: bool = False
     ) -> TaskClaim | None:
-        response = self._http.post(
+        payload = self._request("POST",
             "/api/tasks/claim",
             json={
                 "worker_id": worker_id,
@@ -105,13 +130,9 @@ class WorkerClient:
                 "interactive_only": interactive_only,
             },
         )
-        if response.status_code == 204:
+        if not payload:
             return None
-        if response.status_code >= 400:
-            raise WorkerClientError(
-                f"Task claim failed with {response.status_code}: {response.text}"
-            )
-        task = TaskClaim.from_payload(response.json())
+        task = TaskClaim.from_payload(payload)
         return TaskClaim(
             task.task_id,
             task.attempt_id,
@@ -124,7 +145,7 @@ class WorkerClient:
 
     def heartbeat(self, task: TaskClaim, worker_id: str | None = None) -> dict[str, Any]:
         payload = {"attempt_id": task.attempt_id, "worker_id": worker_id or task.worker_id or ""}
-        return self._request("POST", f"/api/tasks/{task.task_id}/heartbeat", json=payload)
+        return self._retry_post(f"/api/tasks/{task.task_id}/heartbeat", body=payload, timeout=30.0)
 
     def progress(
         self,
@@ -144,7 +165,7 @@ class WorkerClient:
             payload["worker_id"] = task.worker_id
         if telemetry is not None:
             payload["telemetry"] = telemetry
-        return self._request("POST", f"/api/tasks/{task.task_id}/progress", json=payload)
+        return self._retry_post(f"/api/tasks/{task.task_id}/progress", body=payload, timeout=30.0)
 
     def complete(
         self,
@@ -177,14 +198,45 @@ class WorkerClient:
     ) -> dict[str, Any]:
         handle = source.open("rb") if isinstance(source, Path) else source
         try:
-            return self._request(
-                "POST",
-                f"/api/storage/{project_id}/{version_id}/upload",
-                files={"file": (path, handle, "application/octet-stream")},
-            )
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(0)
+            root = f"/api/storage/{project_id}/{version_id}"
+            if size <= self._upload_chunk_bytes:
+                return self._retry_post(f"{root}/upload", path, handle)
+            return self._upload_chunked(root, path, handle, size)
         finally:
             if isinstance(source, Path):
                 handle.close()
+
+    def _retry_post(
+        self, endpoint: str, filename: str | None = None, stream: BinaryIO | None = None,
+        body: dict[str, object] | None = None, *, timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        for attempt in range(self._upload_attempts):
+            try:
+                if stream is not None:
+                    stream.seek(0)
+                    return self._request("POST", endpoint, timeout=timeout,
+                                         files={"file": (filename, stream, "application/octet-stream")})
+                return self._request("POST", endpoint, json=body, timeout=timeout)
+            except RetryableWorkerError:
+                if attempt + 1 == self._upload_attempts:
+                    raise
+                time.sleep(self._retry_delay * 2 ** attempt)
+        raise WorkerClientError(f"Request retries exhausted for {endpoint}")
+
+    def _upload_chunked(self, root: str, path: str, handle: BinaryIO, size: int) -> dict[str, Any]:
+        endpoint = f"{root}/uploads/{uuid.uuid4()}"
+        digest = hashlib.sha256()
+        count = 0
+        while chunk := handle.read(self._upload_chunk_bytes):
+            digest.update(chunk)
+            self._retry_post(f"{endpoint}/parts/{count}", "part", io.BytesIO(chunk))
+            count += 1
+        return self._retry_post(f"{endpoint}/complete", body={
+            "path": path, "part_count": count, "size": size, "sha256": digest.hexdigest(),
+        })
 
     def upload_key(self, key: str, source: BinaryIO | Path) -> dict[str, Any]:
         project_id, scope, path = split_storage_key(key)

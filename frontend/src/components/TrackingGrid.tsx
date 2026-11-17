@@ -145,6 +145,12 @@ export default function TrackingGrid({
                   }}
                 />
               </label>
+              {onSelectFrameForRefine ? (
+                <button type="button" disabled={busy} aria-label={`Mark object in frame ${item.frame_idx}`}
+                  onClick={() => onSelectFrameForRefine(item.frame_idx)}>
+                  Mark Object
+                </button>
+              ) : null}
             </article>
           );
         })}

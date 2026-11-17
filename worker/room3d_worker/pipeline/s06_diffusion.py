@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from room3d_worker.common.errors import StageExecutionError
+from room3d_worker.common.progress import report_progress
 
 LOGGER = logging.getLogger(__name__)
 
@@ -463,6 +464,8 @@ def generate_first_frame_seeds(
         out_path = output_dir / f"seed_{int(seed)}.png"
         Image.fromarray(comp).save(out_path, format="PNG")
         previews.append({"seed_id": f"seed_{int(seed)}", "seed": int(seed), "path": str(out_path)})
+        report_progress("06_diffusion", 100 * len(previews) / len(seeds),
+                        f"Generated seed preview {len(previews)}/{len(seeds)}", seed=int(seed))
     elapsed = max(time.perf_counter() - t0, 1e-6)
     sec_per_frame = round(elapsed / max(len(seeds), 1), 4)
     peak_vram_mb = _read_peak_vram_mb(cfg.device)
@@ -550,6 +553,8 @@ def _propagate_sequential(
             comp = orig
             frame_records[idx] = {"frame_idx": idx, "skipped": True, "method": "unchanged_original", "mask_coverage": 0.0}
         max_diff = max(max_diff, _save_edited_frame(edited_dir, idx, comp, orig, mask))
+        report_progress("06_diffusion", 100 * len(frame_records) / max(len(frame_paths), 1),
+                        f"Edited frame {len(frame_records)}/{len(frame_paths)}", frame_idx=idx)
     return edited_count, max_diff
 
 

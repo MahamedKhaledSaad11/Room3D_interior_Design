@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { storageKeyUrl } from "@/lib/api";
 
 export interface PromptPoint {
@@ -43,12 +43,6 @@ export default function ObjectSelector({
 }: ObjectSelectorProps) {
   const [label, setLabel] = useState<1 | 0>(1);
   const [showMask, setShowMask] = useState(true);
-  const [maskVersion, setMaskVersion] = useState(0);
-
-  // Same key is overwritten in place after each refine, so bump a cache-buster.
-  useEffect(() => {
-    setMaskVersion((v) => v + 1);
-  }, [maskKey, points.length]);
 
   const handleImageClick = (event: React.MouseEvent<HTMLDivElement>) => {
     if (busy) return;
@@ -96,9 +90,8 @@ export default function ObjectSelector({
       >
         {imageUrl ? <img src={imageUrl} alt={`Reference frame ${refFrameIdx}`} style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} /> : null}
         {maskKey && showMask ? (
-          // eslint-disable-next-line @next/next/no-img-element
           <img
-            src={maskOverlayUrl(maskKey, `${maskVersion}-${cacheKey}`)}
+            src={maskOverlayUrl(maskKey, `${points.length}-${cacheKey}`)}
             alt={`Segmentation mask for frame ${refFrameIdx}`}
             data-testid="mask-overlay"
             style={{

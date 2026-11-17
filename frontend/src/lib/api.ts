@@ -15,7 +15,7 @@ export interface Telemetry { vram_used_mb?: number; vram_total_mb?: number; runt
 export interface SceneVersion { id: string; label: string; parent_version_id: string | null; created_at: string; }
 export interface ProjectDetail extends Project { versions: Array<{ id: string; label: string }>; tasks: TaskSummary[]; edit_sessions: EditSession[]; }
 export interface MaskSummaryEntry { frame_idx: number; mask_key?: string | null; status?: string; skip_frame?: boolean; }
-export interface EditSession { id: string; status?: string; base_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; }
+export interface EditSession { id: string; status?: string; base_version_id?: string | null; target_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; }
 export interface ResolveClickBody {
   screenX?: number;
   screenY?: number;

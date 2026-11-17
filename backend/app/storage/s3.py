@@ -36,10 +36,10 @@ class S3Storage(StorageDriver):
         return counter.total
 
     def open_read(self, key: str) -> BinaryIO:
-        from io import BytesIO
-
-        body = self.client.get_object(Bucket=self.bucket, Key=validate_key(key))["Body"]
-        return BytesIO(body.read())
+        try:
+            return self.client.get_object(Bucket=self.bucket, Key=validate_key(key))["Body"]
+        except self.client.exceptions.NoSuchKey as exc:
+            raise FileNotFoundError(key) from exc
 
     def exists(self, key: str) -> bool:
         try:
@@ -50,8 +50,11 @@ class S3Storage(StorageDriver):
 
     def delete_prefix(self, prefix: str) -> int:
         normalized = validate_key(prefix)
-        response = self.client.list_objects_v2(Bucket=self.bucket, Prefix=normalized)
-        objects = response.get("Contents", [])
-        if objects:
-            self.client.delete_objects(Bucket=self.bucket, Delete={"Objects": [{"Key": x["Key"]} for x in objects]})
-        return len(objects)
+        count = 0
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=normalized):
+            objects = page.get("Contents", [])
+            if objects:
+                self.client.delete_objects(Bucket=self.bucket, Delete={"Objects": [{"Key": x["Key"]} for x in objects]})
+                count += len(objects)
+        return count

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import mimetypes
+from collections.abc import Iterator
+from typing import BinaryIO
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -87,4 +91,13 @@ def storage_download(
         stream = storage.open_read(key)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400 if isinstance(exc, ValueError) else 404, detail="invalid or missing storage object") from exc
-    return StreamingResponse(stream, media_type="application/octet-stream")
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return StreamingResponse(_storage_chunks(stream), media_type=media_type)
+
+
+def _storage_chunks(stream: BinaryIO) -> Iterator[bytes]:
+    try:
+        while chunk := stream.read(1024 * 1024):
+            yield chunk
+    finally:
+        stream.close()

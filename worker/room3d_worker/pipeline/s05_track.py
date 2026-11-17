@@ -20,6 +20,7 @@ from PIL import Image
 from room3d_worker.common.coords import project_world_to_image, unproject_pixel_to_ray
 from room3d_worker.common.errors import GeometryError, StageExecutionError
 from room3d_worker.common.manifest import FrameRecord, SceneManifest
+from room3d_worker.common.progress import report_progress
 
 MaskArray = NDArray[np.uint8]
 FloatArray = NDArray[np.float32]
@@ -438,7 +439,9 @@ def run_tracking_pipeline(
     """Run SAM 2.1 click refinement and 5-tier propagation, returning mask PNGs and metrics."""
     hw = (manifest.height, manifest.width)
     seed_mask, click_ms = sam_session.segment_clicks(image_paths[ref_frame_idx], points, hw)
+    report_progress("05_track", 5, "Reference mask ready; propagating through video")
     raw_masks = track_vos(video_backend, image_paths, ref_frame_idx, seed_mask, hw, inference_state_device="cpu")
+    report_progress("05_track", 65, "Validating tracked masks across views")
     _, iou_flagged = filter_neighbor_iou(raw_masks, ref_frame_idx)
     reprojected, visibility, recovered = lift_and_reproject_masks(raw_masks, manifest, image_paths, depth_dir, ref_frame_idx, sam_session)
     for bad_idx in iou_flagged - recovered:
@@ -447,6 +450,7 @@ def run_tracking_pipeline(
     for rej in reid_rejected:
         reprojected[rej] = np.zeros(hw, dtype=np.uint8)
     final_masks, skipped = apply_manual_mask_overrides(reprojected, overrides, hw)
+    report_progress("05_track", 85, "Applied manual mask corrections")
     masks_dir = output_dir / "masks"
     saved = {idx: save_binary_mask_png(mask, masks_dir / f"{idx:06d}.png", hw) for idx, mask in sorted(final_masks.items())}
     stats = {
@@ -568,6 +572,8 @@ class _Sam2Video:
             results: dict[int, MaskArray] = {}
             for pos, _obj_ids, logits in self._pred.propagate_in_video(state, **fwd_kwargs):
                 results[idx_map[pos]] = _logits_to_binary_mask(logits)
+                report_progress("05_track", 5 + 55 * len(results) / len(ordered_keys),
+                                f"Tracked {len(results)}/{len(ordered_keys)} frames")
             if ref_pos > 0 and supports_bidir:
                 _, rev_kwargs = self._propagate_kwargs(ref_pos, reverse=True)
                 for pos, _obj_ids, logits in self._pred.propagate_in_video(state, **rev_kwargs):

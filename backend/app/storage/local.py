@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
@@ -22,10 +24,15 @@ class LocalStorage(StorageDriver):
         target = self.safe_resolve(key)
         target.parent.mkdir(parents=True, exist_ok=True)
         total = 0
-        with target.open("wb") as output:
-            while chunk := stream.read(chunk_size):
-                output.write(chunk)
-                total += len(chunk)
+        fd, pending = tempfile.mkstemp(prefix=".upload-", dir=target.parent)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                while chunk := stream.read(chunk_size):
+                    output.write(chunk)
+                    total += len(chunk)
+            os.replace(pending, target)
+        finally:
+            Path(pending).unlink(missing_ok=True)
         return total
 
     def open_read(self, key: str) -> BinaryIO:

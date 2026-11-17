@@ -6,7 +6,7 @@ import EditStudio from "@/components/EditStudio";
 import { ProgressPanel } from "@/components/ProgressPanel";
 import Viewer3D from "@/components/Viewer3D";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { roomApi, type Manifest, type ProjectDetail, type TaskSummary, type ViewerController } from "@/lib/api";
+import { API_BASE, roomApi, type Manifest, type ProjectDetail, type TaskSummary, type ViewerController } from "@/lib/api";
 
 export default function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
   const [projectId, setProjectId] = useState("");
@@ -59,7 +59,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
     displayVersionId && versionManifest?.versionId === displayVersionId ? versionManifest.data : undefined;
   const activeAssetBaseUrl =
     activeManifest && projectId && displayVersionId
-      ? `/api/storage/${encodeURIComponent(projectId)}/${encodeURIComponent(displayVersionId)}`
+      ? `${API_BASE}/api/storage/${encodeURIComponent(projectId)}/${encodeURIComponent(displayVersionId)}`
       : "";
 
   const refresh = useCallback(async () => {
@@ -69,8 +69,8 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   }, [projectId]);
 
   const activeTask = project?.tasks.find(
-    (t) => t.status === "queued" || t.status === "leased" || t.status === "claimed" || t.status === "running",
-  );
+    (t) => t.status === "leased" || t.status === "claimed" || t.status === "running",
+  ) ?? project?.tasks.find((t) => t.status === "queued");
   const task: TaskSummary | undefined = activeTask ?? project?.tasks[0];
   const hasActiveTasks = Boolean(activeTask);
 

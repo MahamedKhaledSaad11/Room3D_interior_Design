@@ -1,6 +1,17 @@
 {
   "schema_version": "1.0.0",
+  "task_aliases": {
+    "reconstruct": "reconstruct_week1",
+    "build_week1": "reconstruct_week1",
+    "segment_track": "track_propagate",
+    "diffusion_propagate": "diffusion_apply",
+    "rebuild": "rebuild_week2"
+  },
   "task_types": [
+    "reconstruct",
+    "segment_track",
+    "diffusion_propagate",
+    "rebuild",
     "reconstruct_week1",
     "pose_benchmark",
     "segment_init",
@@ -29,7 +40,10 @@
       { "id": "05_track", "label": "Cross-Frame Object Masking & Tracking", "weight": 25 },
       { "id": "06_diffusion", "label": "Reference-Conditioned Object Editing", "weight": 35 },
       { "id": "07_rebuild", "label": "Pose-Preserved 3DGS Rebuild & Export", "weight": 40 }
-    ]
+    ],
+    "track_propagate": [{ "id": "05_track", "label": "Object Mask Tracking", "weight": 100 }],
+    "diffusion_preview": [{ "id": "06_diffusion", "label": "Seed Previews", "weight": 100 }],
+    "diffusion_apply": [{ "id": "06_diffusion", "label": "Propagate Edits", "weight": 100 }]
   },
   "pose_backends": [
     "colmap_global",

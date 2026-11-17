@@ -724,7 +724,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BACKEND_URL = {json.dumps(backend_url)}
+BACKEND_URL = os.environ.get("ROOM3D_BACKEND_URL") or {json.dumps(backend_url)}
 WORKER_TOKEN = os.environ.get("ROOM3D_WORKER_TOKEN") or {json.dumps(worker_token)}
 WORKER_ID = os.environ.get("ROOM3D_WORKER_ID", {json.dumps(worker_id)})
 RUN_DAEMON = os.environ.get("ROOM3D_RUN_DAEMON", "0").lower() in {{"1", "true", "yes"}}
@@ -754,7 +754,8 @@ cmd = [
 if RUN_DAEMON:
     subprocess.run(cmd, env=env, check=True)
 else:
-    print("Pull-worker command ready (set ROOM3D_RUN_DAEMON=1 or RUN_DAEMON=True to connect):", " ".join(cmd))
+    print("Pull-worker command ready: set ROOM3D_BACKEND_URL, ROOM3D_WORKER_TOKEN and ROOM3D_RUN_DAEMON=1, then rerun this cell.")
+    print("Handles reconstruction, warm SAM clicks, tracking, diffusion previews/propagation, and rebuild.")
 '''
     )
 

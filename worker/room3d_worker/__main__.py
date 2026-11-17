@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 from pathlib import Path
 
 from room3d_worker.client import WorkerClient
@@ -36,6 +37,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tasks", type=int, default=None, help="Exit after processing N tasks")
     args = parser.parse_args(argv)
 
+    stop = threading.Event()
+    warm_thread: threading.Thread | None = None
+    if not args.interactive_only and not args.once and args.max_tasks is None and not args.capabilities:
+        args.capabilities = [name for name in WorkerClient.BATCH_GPU if name != "pose_benchmark"]
+
+        def interactive_lane() -> None:
+            with WorkerClient(args.server_url, args.worker_token) as warm_client:
+                warm_runner = WorkerRunner(
+                    warm_client, worker_id=f"{args.worker_id}-sam", work_root=args.work_dir,
+                    storage_dir=args.storage_dir, capabilities=["segment_init", "segment_refine"],
+                    interactive_only=True, poll_interval_sec=min(args.poll_interval, 0.25),
+                    heartbeat_interval_sec=args.heartbeat_interval,
+                )
+                warm_runner.run_forever(stop_event=stop)
+
+        warm_thread = threading.Thread(target=interactive_lane, name="interactive-sam", daemon=True)
+        warm_thread.start()
+
+    try:
+        return _run(args, stop)
+    finally:
+        stop.set()
+        if warm_thread is not None:
+            warm_thread.join(timeout=5.0)
+
+
+def _run(args: argparse.Namespace, stop: threading.Event) -> int:
     with WorkerClient(args.server_url, args.worker_token) as client:
         runner = WorkerRunner(
             client,
@@ -51,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.once:
             runner.run_once()
         else:
-            runner.run_forever(max_tasks=args.max_tasks)
+            runner.run_forever(stop_event=stop, max_tasks=args.max_tasks)
     return 0
 
 

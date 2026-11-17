@@ -490,7 +490,7 @@ def preview_seeds(
             "model_variant": body.model_variant,
             "seeds": body.seeds,
             "mask_key": mask_key,
-            "previews_prefix": f"{project.id}/edits/{edit.id}/previews/g{edit.preview_generation}",
+            "previews_prefix": f"{project.id}/edits/{edit.id}/seed_previews/g{edit.preview_generation}",
             "preview_generation": edit.preview_generation,
             "mask_revision": mask_rev,
             "masks_digest": digest,

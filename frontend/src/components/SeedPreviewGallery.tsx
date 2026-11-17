@@ -57,7 +57,6 @@ export default function SeedPreviewGallery({
               onClick={() => onSelectSeed(seed)}
               style={{ padding: "4px", display: "grid", gap: "4px", borderColor: selected ? "#2dd4bf" : undefined, borderWidth: selected ? 2 : 1 }}
             >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={src} alt={`Preview for ${seed}`} data-testid={`seed-preview-img-${seed}`} style={thumbStyle} />
               <span style={{ fontSize: "11px" }}>{seed}</span>
             </button>

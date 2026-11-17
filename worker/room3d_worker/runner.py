@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import json
 import os
 import shutil
@@ -16,9 +17,10 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from room3d_worker.client import StaleAttemptError, TaskClaim, WorkerClient, WorkerClientError
+from room3d_worker.client import RetryableWorkerError, StaleAttemptError, TaskClaim, WorkerClient, WorkerClientError
 from room3d_worker.common.errors import StageExecutionError
 from room3d_worker.common.manifest import SceneManifest, load_manifest
+from room3d_worker.common.progress import ProgressEvent, progress_sink, relay_subprocess_progress
 from room3d_worker.common.subprocess_runner import resolve_physical_gpu, run_stage_on_gpu
 from room3d_worker.pipeline.s01_extract import extract_keyframes
 from room3d_worker.pipeline.s02_poses import BackendName, PoseBackend, PoseRequest, estimate_poses
@@ -60,7 +62,7 @@ class Sam2SessionManager:
     ) -> None:
         self._backend = backend
         self._injected_backend: bool = backend is not None
-        self._model_cfg = model_cfg or os.environ.get("ROOM3D_SAM2_CONFIG", "")
+        self._model_cfg = model_cfg or os.environ.get("ROOM3D_SAM2_CONFIG", "configs/sam2.1/sam2.1_hiera_s.yaml")
         self._checkpoint = checkpoint or os.environ.get("ROOM3D_SAM2_CHECKPOINT", "")
         self._preferred_gpu = preferred_gpu
         self._max_cache_items = max_cache_items
@@ -83,10 +85,6 @@ class Sam2SessionManager:
             if self._backend is not None:
                 self._session = WarmSamSession(self._backend, max_cache_items=self._max_cache_items)
                 return self._session
-            if not self._model_cfg or not self._checkpoint:
-                raise StageExecutionError(
-                    "Interactive SAM 2.1 requires an injected backend or ROOM3D_SAM2_CONFIG + ROOM3D_SAM2_CHECKPOINT"
-                )
             interactive, video = load_sam2_backends(self._model_cfg, self._checkpoint, device=self._resolved_device())
             self._backend = interactive
             self._video_backend = video
@@ -152,7 +150,11 @@ class _StorageAccessor:
     def try_fetch(self, key: str, dest: Path) -> Path | None:
         try:
             return self.fetch(key, dest)
-        except (FileNotFoundError, WorkerClientError):
+        except FileNotFoundError:
+            return None
+        except WorkerClientError as exc:
+            if "404" not in str(exc):
+                raise
             return None
 
     def put(self, key: str, src: Path) -> None:
@@ -233,6 +235,8 @@ class WorkerRunner:
             while not stop_event.wait(interval):
                 try:
                     self.client.heartbeat(task, self.worker_id)
+                except RetryableWorkerError as exc:
+                    logging.getLogger(__name__).warning("Heartbeat will retry: %s", exc)
                 except (StaleAttemptError, WorkerClientError):
                     break
 
@@ -249,14 +253,21 @@ class WorkerRunner:
         try:
             self.client.heartbeat(task, self.worker_id)
             stop_hb, hb_thread = self._start_heartbeat(task)
-            result_payload, manifest_key = self.execute_claim(task)
+            def publish(event: ProgressEvent) -> None:
+                self.client.progress(task, event.stage, event.percent * 0.9, event.message, event.telemetry)
+
+            with progress_sink(publish):
+                result_payload, manifest_key = self.execute_claim(task)
             stop_hb.set()
             hb_thread.join(timeout=2.0)
             self.client.complete(task, result_payload, result_manifest_key=manifest_key)
         except StaleAttemptError:
             return True
         except Exception as exc:
-            self.client.fail(task, type(exc).__name__, str(exc), retryable=isinstance(exc, OSError))
+            try:
+                self.client.fail(task, type(exc).__name__, str(exc), retryable=isinstance(exc, (OSError, RetryableWorkerError)))
+            except StaleAttemptError:
+                logging.getLogger(__name__).info("Attempt %s is already closed", task.attempt_id)
         finally:
             if stop_hb is not None:
                 stop_hb.set()
@@ -270,7 +281,13 @@ class WorkerRunner:
         while not stop_event.is_set():
             if max_tasks is not None and processed >= max_tasks:
                 break
-            if self.run_once():
+            try:
+                ran = self.run_once()
+            except RetryableWorkerError as exc:
+                logging.getLogger(__name__).warning("Backend unavailable; polling will retry: %s", exc)
+                stop_event.wait(self.poll_interval_sec)
+                continue
+            if ran:
                 processed += 1
             else:
                 stop_event.wait(self.poll_interval_sec)
@@ -286,27 +303,47 @@ class WorkerRunner:
             "diffusion_preview": self._handle_diffusion_preview,
             "diffusion_apply": self._handle_diffusion_apply,
             "rebuild_week2": self._handle_rebuild,
+            "reconstruct": self._handle_week1,
+            "segment_track": self._handle_track,
+            "diffusion_propagate": self._handle_diffusion_apply,
+            "rebuild": self._handle_rebuild,
         }
         handler = dispatch.get(task.task_type)
         if handler is None:
             raise WorkerClientError(f"Unsupported task type: {task.task_type}")
-        return handler(task)
+        stage = {"reconstruct": "01_extract", "reconstruct_week1": "01_extract", "build_week1": "01_extract",
+                 "segment_init": "05_track", "segment_refine": "05_track", "segment_track": "05_track",
+                 "track_propagate": "05_track", "rebuild": "07_rebuild", "rebuild_week2": "07_rebuild"}.get(task.task_type, "06_diffusion")
+        self.client.progress(task, stage, 0, "Preparing task inputs")
+        result = handler(task)
+        self.client.progress(task, "04_export" if stage == "01_extract" else stage, 100, "Artifacts uploaded")
+        return result
 
     def _run_isolated(self, stage: str, spec: dict[str, Any], preferred_gpu: int, work_dir: Path) -> dict[str, Any]:
         spec_path = work_dir / f"{stage}_spec.json"
         out_path = work_dir / f"{stage}_out.json"
         spec_path.write_text(json.dumps(spec), encoding="utf-8")
-        run_stage_on_gpu(
-            [sys.executable, "-m", "room3d_worker.stage_cli", stage, "--spec", str(spec_path), "--out", str(out_path)],
-            preferred_gpu,
-            None,
-            self.stage_timeout_sec,
-        )
+        with relay_subprocess_progress(work_dir / f"{stage}_progress.jsonl") as progress_env:
+            run_stage_on_gpu(
+                [sys.executable, "-m", "room3d_worker.stage_cli", stage, "--spec", str(spec_path), "--out", str(out_path)],
+                preferred_gpu, progress_env, self.stage_timeout_sec,
+            )
         return json.loads(out_path.read_text(encoding="utf-8"))
 
     def _fetch_manifest(self, manifest_key: str, dest_dir: Path) -> SceneManifest:
         manifest_path = self.storage.fetch(manifest_key, dest_dir / "manifest.json")
         return load_manifest(manifest_path)
+
+    def _fetch_depths(self, project_id: str, version_id: str, manifest: SceneManifest, scene_dir: Path) -> bool:
+        found = False
+        for frame in manifest.frames:
+            index = frame.frame_idx
+            target = scene_dir / "depths" / f"{index:06d}.npy"
+            for filename in (f"{index:06d}.npy", f"{index:05d}.npy"):
+                if self.storage.try_fetch(f"{project_id}/{version_id}/depths/{filename}", target) is not None:
+                    found = True
+                    break
+        return found
 
     def _handle_week1(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
         payload = task.payload
@@ -378,7 +415,7 @@ class WorkerRunner:
             )
             pose_manifest, _ = estimate_poses(pose_req, backends=self.backends.pose_backends)
 
-        self.client.progress(task, "03_train", 25.0, "Training 3D Gaussian scene")
+        self.client.progress(task, "03_train", 0.0, "Training 3D Gaussian scene")
         train_device = "cuda:0" if self.backends.use_isolated_subprocesses else _stage_device(1)
         allow_synthetic = self.backends.pose_backends is not None
         if self.backends.use_isolated_subprocesses and self.backends.pose_backends is None:
@@ -430,27 +467,38 @@ class WorkerRunner:
             ckpt_path=scene_dir / "gs_state.npz",
         )
 
-        self._upload_scene_bundle(project_id, version_id, scene_dir, pose_manifest)
+        self._upload_scene_bundle(task, project_id, version_id, scene_dir, pose_manifest)
         manifest_key = f"{project_id}/{version_id}/manifest.json"
         return {"version_id": version_id, "label": payload.get("label") or version_id, "manifest_key": manifest_key}, manifest_key
 
-    def _upload_scene_bundle(self, project_id: str, version_id: str, scene_dir: Path, manifest: SceneManifest) -> None:
+    def _upload_files(self, task: TaskClaim, stage: str, files: list[tuple[str, Path]]) -> None:
+        for index, (key, path) in enumerate(files, 1):
+            self.storage.put(key, path)
+            self.client.progress(task, stage, 90 + 10 * index / len(files),
+                                 f"Uploaded artifact {index}/{len(files)}: {path.name}")
+
+    def _upload_scene_bundle(self, task: TaskClaim, project_id: str, version_id: str, scene_dir: Path, manifest: SceneManifest) -> None:
+        for required in ("scene.spz", "manifest.json"):
+            if not (scene_dir / required).is_file():
+                raise StageExecutionError(f"Scene export is missing required artifact: {required}")
+        files: list[tuple[str, Path]] = []
         for rel in ("manifest.json", "scene.spz", "scene.ply", "sparse_points.json", "gs_state.npz", "gs_ckpt.pt"):
             path = scene_dir / rel
             if path.is_file():
-                self.storage.put(f"{project_id}/{version_id}/{rel}", path)
+                files.append((f"{project_id}/{version_id}/{rel}", path))
         for sparse_file in ("cameras.bin", "images.bin", "points3D.bin"):
             path = scene_dir / "sparse" / "0" / sparse_file
             if path.is_file():
-                self.storage.put(f"{project_id}/{version_id}/sparse/0/{sparse_file}", path)
+                files.append((f"{project_id}/{version_id}/sparse/0/{sparse_file}", path))
         for frame in manifest.frames:
             img_path = scene_dir / frame.image_relpath
             if img_path.is_file():
-                self.storage.put(f"{project_id}/{version_id}/{frame.image_relpath}", img_path)
+                files.append((f"{project_id}/{version_id}/{frame.image_relpath}", img_path))
         depths_dir = scene_dir / "depths"
         if depths_dir.is_dir():
             for npy in depths_dir.glob("*.npy"):
-                self.storage.put(f"{project_id}/{version_id}/depths/{npy.name}", npy)
+                files.append((f"{project_id}/{version_id}/depths/{npy.name}", npy))
+        self._upload_files(task, "04_export" if task.task_type in {"reconstruct", "reconstruct_week1", "build_week1"} else "07_rebuild", files)
 
     def _handle_segment(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
         payload = task.payload
@@ -479,10 +527,12 @@ class WorkerRunner:
         mask_out_key = str(payload.get("mask_out_key") or f"{project_id}/edits/{edit_id}/masks/{ref_idx:06d}.png")
         local_mask = self.work_root / task.task_id / f"{ref_idx:06d}.png"
         assert self.backends.sam_manager is not None
+        self.client.progress(task, "05_track", 10, "Refining reference mask with warm SAM session")
         _, latency_ms = self.backends.sam_manager.segment(local_img, points, (manifest.height, manifest.width), local_mask)
         self.storage.put(mask_out_key, local_mask)
 
-        mask_entry = {"frame_idx": ref_idx, "mask_key": mask_out_key, "status": "segmented", "skip_frame": False}
+        mask_entry = {"frame_idx": ref_idx, "mask_key": mask_out_key,
+                      "status": "manual" if task.task_type == "segment_refine" else "segmented", "skip_frame": False}
         return {
             "edit_id": edit_id,
             "ref_frame_idx": ref_idx,
@@ -511,18 +561,7 @@ class WorkerRunner:
                 )
 
         depth_dir = scene_dir / "depths"
-        has_depths = False
-        for frame in manifest.frames:
-            target_depth = depth_dir / f"{frame.frame_idx:06d}.npy"
-            fetched = self.storage.try_fetch(
-                f"{project_id}/{base_version_id}/depths/{frame.frame_idx:06d}.npy",
-                target_depth,
-            ) or self.storage.try_fetch(
-                f"{project_id}/{base_version_id}/depths/{frame.frame_idx:05d}.npy",
-                target_depth,
-            )
-            if fetched is not None:
-                has_depths = True
+        has_depths = self._fetch_depths(project_id, base_version_id, manifest, scene_dir)
 
         corrections: dict[str, Any] = payload.get("keyframe_corrections") or payload.get("keyframe_Corrections") or {}
         overrides: list[ManualOverride] = []
@@ -535,7 +574,7 @@ class WorkerRunner:
             mpath = self.storage.try_fetch(str(mkey), work_dir / "manual" / f"{idx:06d}.png") if mkey else None
             overrides.append(ManualOverride(frame_idx=idx, mask_path=mpath, skip_frame=skip))
 
-        self.client.progress(task, "05_track", 40.0, "Tracking object across frames")
+        self.client.progress(task, "05_track", 0.0, "Tracking object across frames")
         use_isolated_track = (
             self.backends.use_isolated_subprocesses
             and self.backends.video_sam is None
@@ -587,12 +626,14 @@ class WorkerRunner:
             )
         skipped_set = {int(i) for i in stats.get("skipped_frames", [])}
         masks_summary: dict[str, dict[str, Any]] = {}
+        mask_files: list[tuple[str, Path]] = []
         for idx, mpath in sorted(saved_masks.items()):
             mask_key = f"{masks_prefix}/{idx:06d}.png"
-            self.storage.put(mask_key, mpath)
+            mask_files.append((mask_key, mpath))
             is_manual = str(idx) in corrections and not bool(corrections[str(idx)].get("skip_frame"))
             status = "skipped" if idx in skipped_set else ("manual" if is_manual else "auto")
             masks_summary[str(idx)] = {"status": status, "mask_key": mask_key, "skip_frame": idx in skipped_set}
+        self._upload_files(task, "05_track", mask_files)
         return {"edit_id": edit_id, "tracked_frames": len(saved_masks), "masks_summary": masks_summary, "report": stats}, None
 
     def _handle_diffusion_preview(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
@@ -602,7 +643,7 @@ class WorkerRunner:
         base_version_id = str(payload["base_version_id"])
         ref_idx = int(payload.get("ref_frame_idx") or 0)
         manifest_key = payload.get("manifest_key") or f"{project_id}/{base_version_id}/manifest.json"
-        previews_prefix = str(payload.get("previews_prefix") or f"{project_id}/edits/{edit_id}/previews").rstrip("/")
+        previews_prefix = str(payload.get("previews_prefix") or f"{project_id}/edits/{edit_id}/seed_previews").rstrip("/")
         if payload.get("preview_generation") is not None:
             gen_tag = f"g{int(payload['preview_generation'])}"
             if gen_tag not in previews_prefix.split("/"):
@@ -618,10 +659,10 @@ class WorkerRunner:
         mask_key = str(payload.get("mask_key") or f"{project_id}/edits/{edit_id}/masks/{ref_idx:06d}.png")
         ref_mask = self.storage.fetch(mask_key, work_dir / "ref_mask.png")
 
-        seeds = [int(s) for s in payload.get("seeds", [101, 202, 303])]
+        seeds = [int(s) for s in payload.get("seeds", [101, 202, 303, 404])]
         variant = payload.get("model_variant") or "flux2_klein_4b"
         negative_prompt = payload.get("negative_prompt")
-        self.client.progress(task, "06_diffusion", 30.0, "Generating seed previews")
+        self.client.progress(task, "06_diffusion", 0.0, "Generating seed previews")
 
         if self.backends.use_isolated_subprocesses and self.backends.inpaint_backend is None:
             out = self._run_isolated(
@@ -649,13 +690,15 @@ class WorkerRunner:
 
         preview_seeds: dict[str, str] = {}
         seeds_out: list[dict[str, Any]] = []
+        preview_files: list[tuple[str, Path]] = []
         for item in generated:
             seed_val = int(item["seed"])
             seed_id = str(item["seed_id"])
             key = f"{previews_prefix}/{seed_id}.png"
-            self.storage.put(key, Path(item["path"]))
+            preview_files.append((key, Path(item["path"])))
             preview_seeds[str(seed_val)] = key
             seeds_out.append({"seed_id": seed_id, "seed": seed_val, "preview_key": key})
+        self._upload_files(task, "06_diffusion", preview_files)
         return {"edit_id": edit_id, "preview_seeds": preview_seeds, "seeds": seeds_out}, None
 
     def _handle_diffusion_apply(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
@@ -692,7 +735,7 @@ class WorkerRunner:
         variant = payload.get("model_variant") or "flux2_klein_4b"
         negative_prompt = payload.get("negative_prompt")
 
-        self.client.progress(task, "06_diffusion", 50.0, "Applying reference-conditioned edits")
+        self.client.progress(task, "06_diffusion", 0.0, "Applying reference-conditioned edits")
         if self.backends.use_isolated_subprocesses and self.backends.inpaint_backend is None:
             metrics = self._run_isolated(
                 "diffusion_apply",
@@ -729,8 +772,9 @@ class WorkerRunner:
             )
 
         edited_dir = work_dir / "diff_out" / "edited_frames"
-        for out_file in sorted(edited_dir.glob("*.png")):
-            self.storage.put(f"{edited_prefix}/{out_file.name}", out_file)
+        self._upload_files(task, "06_diffusion", [
+            (f"{edited_prefix}/{file.name}", file) for file in sorted(edited_dir.glob("*.png"))
+        ])
         return {"edit_id": edit_id, "edited_frames_prefix": edited_prefix, **metrics}, None
 
     def _handle_rebuild(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
@@ -752,6 +796,7 @@ class WorkerRunner:
         masks_dir.mkdir(parents=True, exist_ok=True)
 
         manifest = self._fetch_manifest(manifest_key, base_dir)
+        self._fetch_depths(project_id, base_version_id, manifest, base_dir)
         for rel in ("gs_state.npz", "gs_ckpt.pt", "scene.ply", "sparse/0/cameras.bin", "sparse/0/images.bin", "sparse/0/points3D.bin"):
             self.storage.try_fetch(f"{project_id}/{base_version_id}/{rel}", base_dir / rel)
         masks_summary: dict[str, Any] = dict(payload.get("masks_summary") or {})
@@ -762,7 +807,7 @@ class WorkerRunner:
             mkey = (masks_summary.get(str(idx)) or {}).get("mask_key") or f"{masks_prefix}/{idx:06d}.png"
             self.storage.try_fetch(str(mkey), masks_dir / f"{idx:06d}.png")
 
-        self.client.progress(task, "07_rebuild", 50.0, "Rebuilding 3D Gaussian scene")
+        self.client.progress(task, "07_rebuild", 0.0, "Rebuilding 3D Gaussian scene")
         exclude_frames = tuple(int(i) for i in payload.get("exclude_frames", []))
         mode = payload.get("rebuild_mode", "masked_finetune")
         if self.backends.use_isolated_subprocesses and self.backends.rebuild_backend is None:
@@ -800,13 +845,7 @@ class WorkerRunner:
             metrics = rebuild_scene(req, backend=self.backends.rebuild_backend)
             rebuilt_manifest = load_manifest(out_dir / "manifest.json")
 
-        self._upload_scene_bundle(project_id, new_version_id, out_dir, rebuilt_manifest)
-        for frame in rebuilt_manifest.frames:
-            edited_file = edited_dir / f"{frame.frame_idx:06d}.png"
-            src = edited_file if edited_file.is_file() else (base_dir / frame.image_relpath)
-            if src.is_file():
-                self.storage.put(f"{project_id}/{new_version_id}/{frame.image_relpath}", src)
-
+        self._upload_scene_bundle(task, project_id, new_version_id, out_dir, rebuilt_manifest)
         out_manifest_key = f"{project_id}/{new_version_id}/manifest.json"
         return {
             "version_id": new_version_id,

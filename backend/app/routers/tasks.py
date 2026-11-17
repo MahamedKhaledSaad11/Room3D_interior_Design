@@ -21,6 +21,7 @@ class ClaimRequest(BaseModel):
 
 class AttemptRequest(BaseModel):
     attempt_id: str
+    worker_id: str | None = None
 
 
 class HeartbeatRequest(AttemptRequest):
@@ -36,6 +37,7 @@ class ProgressRequest(AttemptRequest):
 
 class CompleteRequest(BaseModel):
     attempt_id: str
+    worker_id: str | None = None
     result_manifest_key: str | None = None
     result_payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -68,7 +70,7 @@ def heartbeat(task_id: str, body: HeartbeatRequest, session: Session = Depends(g
 @router.post("/{task_id}/progress")
 def progress(task_id: str, body: ProgressRequest, session: Session = Depends(get_db)) -> dict[str, object]:
     try:
-        value = update_progress(session, task_id, body.attempt_id, body.stage, body.progress_pct, body.message, body.telemetry)
+        value = update_progress(session, task_id, body.attempt_id, body.stage, body.progress_pct, body.message, body.telemetry, worker_id=body.worker_id)
     except ConflictError as exc:
         raise _conflict(exc) from exc
     except ValueError as exc:
@@ -79,7 +81,7 @@ def progress(task_id: str, body: ProgressRequest, session: Session = Depends(get
 @router.post("/{task_id}/complete")
 def complete(task_id: str, body: CompleteRequest, session: Session = Depends(get_db)) -> dict[str, bool]:
     try:
-        complete_task(session, task_id, body.attempt_id, body.result_payload, body.result_manifest_key)
+        complete_task(session, task_id, body.attempt_id, body.result_payload, body.result_manifest_key, worker_id=body.worker_id)
     except ConflictError as exc:
         raise _conflict(exc) from exc
     return {"ok": True}
@@ -88,7 +90,7 @@ def complete(task_id: str, body: CompleteRequest, session: Session = Depends(get
 @router.post("/{task_id}/fail")
 def fail(task_id: str, body: FailRequest, session: Session = Depends(get_db)) -> dict[str, bool]:
     try:
-        fail_task(session, task_id, body.attempt_id, body.error_code, body.error_message, body.retryable)
+        fail_task(session, task_id, body.attempt_id, body.error_code, body.error_message, body.retryable, worker_id=body.worker_id)
     except ConflictError as exc:
         raise _conflict(exc) from exc
     return {"ok": True}

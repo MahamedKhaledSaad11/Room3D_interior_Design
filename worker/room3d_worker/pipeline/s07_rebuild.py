@@ -18,6 +18,7 @@ from scipy.spatial import cKDTree
 
 from room3d_worker.common.errors import GeometryError, StageExecutionError
 from room3d_worker.common.manifest import FrameRecord, SceneManifest, load_manifest
+from room3d_worker.common.progress import report_progress
 from room3d_worker.pipeline.s04_export import ExportRequest, export_scene, normalize_quats, normalize_scales, read_ply_splats
 from room3d_worker.pipeline.s05_track import load_binary_mask_png
 
@@ -470,6 +471,9 @@ def _run_opt_loop(
             loss = (pred - target).abs().mean()
         loss.backward()
         opt.step()
+        if (step + 1) % 50 == 0 or step == steps - 1:
+            report_progress("07_rebuild", 100 * (step + 1) / steps,
+                            f"Rebuild iteration {step + 1}/{steps}", iteration=step + 1)
     return roi_idx, bg_idx, active, frozen, torch_mod
 
 

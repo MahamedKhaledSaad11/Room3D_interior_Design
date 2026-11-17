@@ -16,6 +16,7 @@ from PIL import Image
 from scipy.spatial import cKDTree
 
 from room3d_worker.common.errors import GeometryError, StageExecutionError
+from room3d_worker.common.progress import report_progress
 
 LOGGER = logging.getLogger(__name__)
 SH_C0 = 0.28209479177387814
@@ -423,6 +424,10 @@ def _optimize_with_gsplat(
             if "lr" in post_sig:
                 post_kwargs["lr"] = float(optimizers["means"].param_groups[0]["lr"]) if optimizers["means"].param_groups else config.lr_means
             strategy.step_post_backward(params, optimizers, strategy_state, step, info, **post_kwargs)
+        if (step + 1) % 50 == 0 or step == config.iterations - 1:
+            report_progress("03_train", 100 * (step + 1) / config.iterations,
+                            f"Training iteration {step + 1}/{config.iterations}",
+                            iteration=step + 1, gaussian_count=int(len(params["means"])))
         if step == config.iterations - 1:
             mse = float(((pred - target) ** 2).mean().item())
             last_psnr = float(10.0 * np.log10(1.0 / max(mse, 1e-10)))

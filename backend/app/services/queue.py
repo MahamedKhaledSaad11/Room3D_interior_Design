@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..models import EditSession, Project, SceneVersion, Task, TaskAttempt
 from .progress import compute_progress
+from .task_types import canonical_task_type, expand_capabilities
 
 MAX_TASK_RETRIES = 3
 
@@ -208,6 +209,7 @@ def _reclaim_stale_tasks(session: Session, lease_timeout_sec: int | None = None)
 
 
 def claim_next_task(session: Session, worker_id: str, capabilities: list[str], interactive_only: bool) -> dict[str, Any] | None:
+    capabilities = expand_capabilities(capabilities)
     _reclaim_stale_tasks(session)
     stmt = select(Task.id).where(Task.status == "queued")
     if capabilities:
@@ -292,7 +294,7 @@ def _register_completed_version(
     result: dict[str, Any],
     result_manifest_key: str | None,
 ) -> str | None:
-    if task.task_type not in {"reconstruct_week1", "build_week1", "rebuild_week2"}:
+    if canonical_task_type(task.task_type) not in {"reconstruct_week1", "rebuild_week2"}:
         return None
     version_id = str(result.get("version_id") or "")
     if not version_id and result_manifest_key:
@@ -363,7 +365,8 @@ def _apply_edit_completion(
     if edit is None:
         return
 
-    if task.task_type in {"segment_init", "segment_refine"}:
+    task_type = canonical_task_type(task.task_type)
+    if task_type in {"segment_init", "segment_refine"}:
         summary: dict[str, Any] = json.loads(edit.masks_summary_json or "{}")
         mask_summary = result.get("mask_summary")
         if isinstance(mask_summary, dict):
@@ -381,13 +384,13 @@ def _apply_edit_completion(
         edit.masks_summary_json = json.dumps(summary)
         invalidate_edit_previews(edit)
         edit.status = "segmented"
-    elif task.task_type == "track_propagate":
+    elif task_type == "track_propagate":
         masks_summary = result.get("masks_summary")
         if isinstance(masks_summary, dict):
             edit.masks_summary_json = json.dumps({str(k): v for k, v in masks_summary.items()})
         invalidate_edit_previews(edit)
         edit.status = "tracked"
-    elif task.task_type == "diffusion_preview":
+    elif task_type == "diffusion_preview":
         previews = result.get("preview_seeds")
         extracted: dict[str, str] = {}
         if isinstance(previews, dict):
@@ -415,9 +418,9 @@ def _apply_edit_completion(
             meta["preview_seeds"] = dict(extracted)
             edit.preview_meta_json = json.dumps(meta)
             edit.status = "preview_ready"
-    elif task.task_type == "diffusion_apply":
+    elif task_type == "diffusion_apply":
         edit.status = "Edited"
-    elif task.task_type == "rebuild_week2":
+    elif task_type == "rebuild_week2":
         if version_id:
             edit.target_version_id = version_id
         edit.status = "completed"

@@ -60,7 +60,7 @@ class RefineRequest(BaseModel):
 class PreviewSeedsRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=1000)
     negative_prompt: str | None = Field(default=None, max_length=1000)
-    seeds: list[int] = Field(min_length=1, max_length=8)
+    seeds: list[int] = Field(default_factory=lambda: [101, 202, 303, 404], min_length=1, max_length=8)
     model_variant: Literal["flux2_klein_4b", "sdxl_inpaint_t4"] = "flux2_klein_4b"
 
 

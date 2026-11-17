@@ -24,11 +24,13 @@ export default function HomePage() {
   const [signedIn, setSignedIn] = useState(false);
 
   const loadProjects = useCallback(() => {
-    void roomApi.listProjects().then(setProjects).catch(() => undefined);
+    void roomApi.listProjects()
+      .then(setProjects)
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Unable to load projects."))
+      .finally(() => setSignedIn(Boolean(getAuthToken())));
   }, []);
 
   useEffect(() => {
-    setSignedIn(Boolean(getAuthToken()));
     loadProjects();
   }, [loadProjects]);
 
