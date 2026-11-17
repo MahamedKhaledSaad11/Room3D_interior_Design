@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import json
 import logging
 import os
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -25,6 +28,7 @@ FORBIDDEN_MODEL_PATTERNS = ("9b", "qwen")
 
 
 ModelVariant = Literal["flux2_klein_4b", "sdxl_inpaint_t4"]
+QuantizationMode = Literal["nf4", "int8", "none"]
 
 
 @dataclass(frozen=True)
@@ -40,10 +44,14 @@ class DiffusionConfig:
     use_sequential_offload: bool = False
     grid_2x2: bool = True
     negative_prompt: str = ""
+    quantization: QuantizationMode = "nf4"
+    offload_text_encoder: bool = True
 
     def __post_init__(self) -> None:
         if self.model_variant not in {"flux2_klein_4b", "sdxl_inpaint_t4"}:
             raise ValueError(f"unsupported model_variant: {self.model_variant}")
+        if self.quantization not in {"nf4", "int8", "none"}:
+            raise ValueError(f"unsupported quantization: {self.quantization}")
         if not 0.0 < self.strength <= 1.0:
             raise ValueError("strength must be in (0.0, 1.0]")
         if self.num_inference_steps < 1 or self.guidance_scale < 0.0 or self.feather_px < 0:
@@ -114,12 +122,24 @@ def _match_reference_lab_colors(
 
 
 class _DiffusersBackend:
-    def __init__(self, pipe: Any, torch_mod: Any, config: DiffusionConfig, supports_ref: bool, exec_device: str) -> None:
+    def __init__(
+        self,
+        pipe: Any,
+        torch_mod: Any,
+        config: DiffusionConfig,
+        supports_ref: bool,
+        exec_device: str,
+        quantization_mode: str = "fp16_offload",
+        torch_dtype_name: str = "float16",
+    ) -> None:
         self._pipe = pipe
         self._torch = torch_mod
         self._config = config
         self._supports_ref = supports_ref
         self._exec_device = exec_device
+        self.quantization_mode = quantization_mode
+        self.torch_dtype_name = torch_dtype_name
+        self.offload_text_encoder = bool(exec_device.startswith("cuda") and config.offload_text_encoder)
 
     def inpaint(
         self,
@@ -150,13 +170,45 @@ class _DiffusersBackend:
 
 
 class _DiffusersFluxKleinBackend(_DiffusersBackend):
-    def __init__(self, pipe: Any, torch_mod: Any, config: DiffusionConfig, exec_device: str) -> None:
-        super().__init__(pipe, torch_mod, config, supports_ref=True, exec_device=exec_device)
+    def __init__(
+        self,
+        pipe: Any,
+        torch_mod: Any,
+        config: DiffusionConfig,
+        exec_device: str,
+        quantization_mode: str = "fp16_offload",
+        torch_dtype_name: str = "float16",
+    ) -> None:
+        super().__init__(
+            pipe,
+            torch_mod,
+            config,
+            supports_ref=True,
+            exec_device=exec_device,
+            quantization_mode=quantization_mode,
+            torch_dtype_name=torch_dtype_name,
+        )
 
 
 class _DiffusersSdxlBackend(_DiffusersBackend):
-    def __init__(self, pipe: Any, torch_mod: Any, config: DiffusionConfig, exec_device: str) -> None:
-        super().__init__(pipe, torch_mod, config, supports_ref=False, exec_device=exec_device)
+    def __init__(
+        self,
+        pipe: Any,
+        torch_mod: Any,
+        config: DiffusionConfig,
+        exec_device: str,
+        quantization_mode: str = "fp16_offload",
+        torch_dtype_name: str = "float16",
+    ) -> None:
+        super().__init__(
+            pipe,
+            torch_mod,
+            config,
+            supports_ref=False,
+            exec_device=exec_device,
+            quantization_mode=quantization_mode,
+            torch_dtype_name=torch_dtype_name,
+        )
         self.last_reference_conditioning: str | None = None
 
     def inpaint(
@@ -342,6 +394,44 @@ def _run_padded_inpaint(
     return composited
 
 
+def _cuda_ordinal_if_active(device: str) -> tuple[Any, int] | None:
+    if not device.startswith("cuda"):
+        return None
+    try:
+        torch_mod = importlib.import_module("torch")
+    except ImportError:
+        return None
+    cuda = getattr(torch_mod, "cuda", None)
+    if cuda is None or not callable(getattr(cuda, "is_available", None)) or not cuda.is_available():
+        return None
+    is_init = getattr(cuda, "is_initialized", None)
+    if callable(is_init) and not is_init():
+        return None
+    ordinal = int(device.split(":")[1]) if ":" in device else 0
+    if hasattr(cuda, "device_count") and ordinal >= cuda.device_count():
+        ordinal = 0
+    return torch_mod, ordinal
+
+
+def _reset_vram_peak(device: str) -> None:
+    info = _cuda_ordinal_if_active(device)
+    if info is None:
+        return
+    torch_mod, ordinal = info
+    if hasattr(torch_mod.cuda, "reset_peak_memory_stats"):
+        torch_mod.cuda.reset_peak_memory_stats(ordinal)
+
+
+def _read_peak_vram_mb(device: str) -> float:
+    info = _cuda_ordinal_if_active(device)
+    if info is None:
+        return 0.0
+    torch_mod, ordinal = info
+    if not hasattr(torch_mod.cuda, "max_memory_allocated"):
+        return 0.0
+    return round(float(torch_mod.cuda.max_memory_allocated(ordinal)) / (1024.0 * 1024.0), 2)
+
+
 def generate_first_frame_seeds(
     ref_image_path: Path,
     ref_mask_path: Path,
@@ -357,6 +447,8 @@ def generate_first_frame_seeds(
     orig = _load_rgb(ref_image_path)
     mask = _load_mask(ref_mask_path, orig.shape[:2])
     output_dir.mkdir(parents=True, exist_ok=True)
+    _reset_vram_peak(cfg.device)
+    t0 = time.perf_counter()
     previews: list[dict[str, Any]] = []
     for seed in seeds:
         comp = _run_padded_inpaint(
@@ -371,6 +463,27 @@ def generate_first_frame_seeds(
         out_path = output_dir / f"seed_{int(seed)}.png"
         Image.fromarray(comp).save(out_path, format="PNG")
         previews.append({"seed_id": f"seed_{int(seed)}", "seed": int(seed), "path": str(out_path)})
+    elapsed = max(time.perf_counter() - t0, 1e-6)
+    sec_per_frame = round(elapsed / max(len(seeds), 1), 4)
+    peak_vram_mb = _read_peak_vram_mb(cfg.device)
+    for item in previews:
+        item["sec_per_frame"] = sec_per_frame
+        item["peak_vram_mb"] = peak_vram_mb
+    (output_dir / "seed_metrics.json").write_text(
+        json.dumps(
+            {
+                "num_seeds": len(seeds),
+                "elapsed_sec": round(elapsed, 4),
+                "sec_per_frame": sec_per_frame,
+                "peak_vram_mb": peak_vram_mb,
+                "quantization_mode": getattr(backend, "quantization_mode", cfg.quantization),
+                "dtype": getattr(backend, "torch_dtype_name", "unknown"),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return previews
 
 
@@ -522,6 +635,8 @@ def propagate_masked_edits(
     ref_edit = _load_rgb(ref_edited_path)
     edited_dir = output_dir / "edited_frames"
     edited_dir.mkdir(parents=True, exist_ok=True)
+    _reset_vram_peak(cfg.device)
+    t0 = time.perf_counter()
     ref_mask_path = mask_paths.get(ref_frame_idx)
     ref_mask = _load_mask(ref_mask_path, ref_edit.shape[:2]) if ref_mask_path is not None and ref_mask_path.exists() else None
     skipped = skip_frames or set()
@@ -585,6 +700,9 @@ def propagate_masked_edits(
 
     edited_count += inpainted_count
     skipped_count = sum(1 for rec in frame_records.values() if rec["skipped"])
+    elapsed = max(time.perf_counter() - t0, 1e-6)
+    sec_per_frame = round(elapsed / max(edited_count, len(frame_paths), 1), 4)
+    peak_vram_mb = _read_peak_vram_mb(cfg.device)
     metrics = {
         "ref_frame_idx": ref_frame_idx,
         "frames_edited": edited_count,
@@ -596,6 +714,12 @@ def propagate_masked_edits(
         "negative_prompt": neg,
         "model_id": cfg.model_id,
         "model_variant": cfg.model_variant,
+        "quantization": cfg.quantization,
+        "quantization_mode": getattr(backend, "quantization_mode", cfg.quantization),
+        "dtype": getattr(backend, "torch_dtype_name", "unknown"),
+        "elapsed_sec": round(elapsed, 4),
+        "sec_per_frame": sec_per_frame,
+        "peak_vram_mb": peak_vram_mb,
         "frames": [frame_records[idx] for idx in sorted(frame_records)],
     }
     (output_dir / "diffusion_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
@@ -609,8 +733,78 @@ def _resolve_gpu_ordinal(device: str, torch_mod: Any) -> tuple[bool, int]:
     return (True, ordinal if ordinal < torch_mod.cuda.device_count() else 0)
 
 
+def _has_bitsandbytes() -> bool:
+    if "bitsandbytes" in sys.modules:
+        return sys.modules["bitsandbytes"] is not None
+    try:
+        return importlib.util.find_spec("bitsandbytes") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _build_quantization_kwargs(
+    cfg: DiffusionConfig,
+    torch_mod: Any,
+    diffusers_mod: Any,
+    is_cuda: bool,
+) -> tuple[dict[str, Any], str]:
+    if not is_cuda:
+        return {}, "fp32_cpu"
+    if cfg.quantization == "none":
+        return {}, "fp16_offload"
+    if cfg.quantization == "nf4":
+        pipe_q_cls = getattr(diffusers_mod, "PipelineQuantizationConfig", None)
+        if callable(pipe_q_cls) and _has_bitsandbytes():
+            q_cfg = pipe_q_cls(
+                quant_backend="bitsandbytes_4bit",
+                quant_kwargs={
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_type": "nf4",
+                    "bnb_4bit_compute_dtype": torch_mod.float16,
+                },
+            )
+            return {"quantization_config": q_cfg}, "nf4"
+        LOGGER.info("NF4 requires diffusers.PipelineQuantizationConfig + bitsandbytes; probing optimum.quanto INT8 fallback")
+    try:
+        quanto_mod = importlib.import_module("optimum.quanto")
+    except (ImportError, OSError, RuntimeError):
+        return {}, "fp16_offload"
+    if hasattr(quanto_mod, "quantize") and hasattr(quanto_mod, "freeze") and hasattr(quanto_mod, "qint8"):
+        return {}, "int8_quanto"
+    return {}, "fp16_offload"
+
+
+def _apply_quanto_int8(pipe: Any) -> None:
+    quanto_mod = importlib.import_module("optimum.quanto")
+    for attr in ("transformer", "unet"):
+        submod = getattr(pipe, attr, None)
+        if submod is not None:
+            quanto_mod.quantize(submod, weights=quanto_mod.qint8)
+            quanto_mod.freeze(submod)
+
+
+def _from_pretrained_with_quant(
+    cls: Any,
+    repo_id: str,
+    dtype: Any,
+    hf_token: str | None,
+    quant_kwargs: dict[str, Any],
+) -> Any:
+    kwargs: dict[str, Any] = {"torch_dtype": dtype, "token": hf_token}
+    if quant_kwargs:
+        try:
+            params = inspect.signature(cls.from_pretrained).parameters
+            accepts_var = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            for k, v in quant_kwargs.items():
+                if k in params or accepts_var:
+                    kwargs[k] = v
+        except (TypeError, ValueError):
+            kwargs.update(quant_kwargs)
+    return cls.from_pretrained(repo_id, **kwargs)
+
+
 def load_diffusion_backend(config: DiffusionConfig | None = None) -> InpaintBackend:
-    """Load T4-safe float16/CPU-offload FLUX.2 Klein 4B or SDXL inpainting pipeline without bitsandbytes."""
+    """Load T4-safe float16 pipeline with NF4/INT8 quantization and CPU text-encoder offload."""
     cfg = config or DiffusionConfig()
     try:
         torch = importlib.import_module("torch")
@@ -619,33 +813,40 @@ def load_diffusion_backend(config: DiffusionConfig | None = None) -> InpaintBack
         raise StageExecutionError("s06_diffusion requires torch and diffusers when loading live weights") from exc
     is_cuda, gpu_id = _resolve_gpu_ordinal(cfg.device, torch)
     cap = torch.cuda.get_device_capability(gpu_id) if is_cuda else None
-    dtype = getattr(torch, resolve_t4_dtype(cap))
+    dtype_name = resolve_t4_dtype(cap)
+    dtype = getattr(torch, dtype_name)
     flux_cls = getattr(diffusers, "Flux2KleinInpaintPipeline", None) or getattr(diffusers, "FluxKleinInpaintPipeline", None)
     sdxl_cls = getattr(diffusers, "StableDiffusionXLInpaintPipeline", None)
     hf_token = os.environ.get("HF_TOKEN") or None
     exec_device = f"cuda:{gpu_id}" if is_cuda else "cpu"
+    quant_kwargs, quant_mode = _build_quantization_kwargs(cfg, torch, diffusers, is_cuda)
 
     backend: _DiffusersBackend
     if cfg.model_variant == "sdxl_inpaint_t4":
         if sdxl_cls is None:
             raise StageExecutionError("diffusers must provide StableDiffusionXLInpaintPipeline for sdxl_inpaint_t4")
         sdxl_repo = cfg.fallback_model_id if cfg.model_id == DiffusionConfig.model_id else cfg.model_id
-        pipe = sdxl_cls.from_pretrained(sdxl_repo, torch_dtype=dtype, token=hf_token)
-        backend = _DiffusersSdxlBackend(pipe, torch, cfg, exec_device=exec_device)
+        pipe = _from_pretrained_with_quant(sdxl_cls, sdxl_repo, dtype, hf_token, quant_kwargs)
+        backend = _DiffusersSdxlBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
     elif flux_cls is not None:
-        pipe = flux_cls.from_pretrained(cfg.model_id, torch_dtype=dtype, token=hf_token)
-        backend = _DiffusersFluxKleinBackend(pipe, torch, cfg, exec_device=exec_device)
+        pipe = _from_pretrained_with_quant(flux_cls, cfg.model_id, dtype, hf_token, quant_kwargs)
+        backend = _DiffusersFluxKleinBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
     elif sdxl_cls is not None:
-        pipe = sdxl_cls.from_pretrained(cfg.fallback_model_id, torch_dtype=dtype, token=hf_token)
-        backend = _DiffusersSdxlBackend(pipe, torch, cfg, exec_device=exec_device)
+        pipe = _from_pretrained_with_quant(sdxl_cls, cfg.fallback_model_id, dtype, hf_token, quant_kwargs)
+        backend = _DiffusersSdxlBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
     else:
         raise StageExecutionError("diffusers must provide Flux2KleinInpaintPipeline or StableDiffusionXLInpaintPipeline")
+
+    if quant_mode == "int8_quanto":
+        _apply_quanto_int8(pipe)
 
     if is_cuda:
         if cfg.use_sequential_offload:
             pipe.enable_sequential_cpu_offload(gpu_id=gpu_id)
-        else:
+        elif cfg.offload_text_encoder:
             pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+        else:
+            pipe.to(exec_device)
     else:
         pipe.to("cpu")
     for fn_name in ("enable_vae_tiling", "enable_vae_slicing"):

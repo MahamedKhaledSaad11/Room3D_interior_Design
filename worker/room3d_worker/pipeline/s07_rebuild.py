@@ -524,11 +524,118 @@ def _validate_rebuild_preconditions(request: RebuildRequest, base_manifest: Scen
         raise StageExecutionError(f"Missing canonical sparse/0 directory under {request.base_dir}")
 
 
+def _populate_rebuilt_media(request: RebuildRequest, base_manifest: SceneManifest, skip_set: set[int]) -> list[dict[str, Any]]:
+    """Populate output_dir/<frame.image_relpath> losslessly and merge depths/ into output_dir."""
+    orig_dir = _resolve_orig_frames_dir(request, None)
+    updated_frames: list[dict[str, Any]] = []
+    for frame in base_manifest.frames:
+        frame_dict = frame.model_dump()
+        rel_path = Path(frame.image_relpath)
+        use_edited = not frame.excluded and frame.frame_idx not in skip_set
+        edited_src = _resolve_frame_file(request.edited_frames_dir, frame.frame_idx, frame.image_relpath) if use_edited else None
+        if edited_src is not None:
+            # Preserve lossless PNG edited frames without JPEG re-compression so unmasked pixels have max_abs_diff == 0.
+            if edited_src.suffix.lower() == ".png" and rel_path.suffix.lower() != ".png":
+                rel_path = rel_path.with_suffix(".png")
+                frame_dict["image_relpath"] = rel_path.as_posix()
+            dst_img = request.output_dir / rel_path
+            dst_img.parent.mkdir(parents=True, exist_ok=True)
+            if edited_src.suffix.lower() == dst_img.suffix.lower():
+                shutil.copy2(edited_src, dst_img)
+            else:
+                with Image.open(edited_src) as img:
+                    img.convert("RGB").save(dst_img)
+            updated_frames.append(frame_dict)
+            continue
+        dst_img = request.output_dir / rel_path
+        base_src = request.base_dir / rel_path
+        orig_src = _resolve_frame_file(orig_dir, frame.frame_idx, frame.image_relpath) if orig_dir is not None else None
+        src = base_src if base_src.is_file() else orig_src
+        if src is not None and src.is_file():
+            dst_img.parent.mkdir(parents=True, exist_ok=True)
+            if src.suffix.lower() == dst_img.suffix.lower():
+                shutil.copy2(src, dst_img)
+            else:
+                with Image.open(src) as img:
+                    img.convert("RGB").save(dst_img)
+            updated_frames.append(frame_dict)
+            continue
+        if dst_img.is_file():
+            updated_frames.append(frame_dict)
+            continue
+        raise StageExecutionError(f"Missing base frame image for rebuild: {frame.image_relpath}")
+    base_depths = request.base_dir / "depths"
+    out_depths = request.output_dir / "depths"
+    if base_depths.is_dir():
+        out_depths.mkdir(parents=True, exist_ok=True)
+        for depth_file in base_depths.iterdir():
+            if depth_file.is_file() and not (out_depths / depth_file.name).exists():
+                shutil.copy2(depth_file, out_depths / depth_file.name)
+    return updated_frames
+
+
+def _sync_colmap_images_bin_names(images_bin_path: Path, rebuilt_frames: list[dict[str, Any]]) -> None:
+    """Keep COLMAP images.bin filenames aligned when edited frames switch from .jpg to lossless .png."""
+    if not images_bin_path.is_file():
+        raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: file missing")
+    data = images_bin_path.read_bytes()
+    if len(data) < 8:
+        raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: short count header")
+    by_image_id = {
+        int(f["colmap_image_id"]): Path(str(f["image_relpath"])).name
+        for f in rebuilt_frames
+        if f.get("colmap_image_id") is not None and f.get("image_relpath")
+    }
+    by_stem = {
+        Path(str(f["image_relpath"])).stem: Path(str(f["image_relpath"])).name
+        for f in rebuilt_frames
+        if f.get("image_relpath")
+    }
+    hdr_size = struct.calcsize("<I4d3dI")
+    try:
+        num_images = struct.unpack_from("<Q", data, 0)[0]
+        offset = 8
+        out_chunks = [data[:8]]
+        for _ in range(num_images):
+            if offset + hdr_size > len(data):
+                raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: truncated image header")
+            image_id = struct.unpack_from("<I", data, offset)[0]
+            header_bytes = data[offset : offset + hdr_size]
+            offset += hdr_size
+            nul = data.find(b"\x00", offset)
+            if nul < 0:
+                raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: unterminated filename")
+            old_name = data[offset:nul].decode("utf-8")
+            offset = nul + 1
+            if offset + 8 > len(data):
+                raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: truncated num_pts2d")
+            num_pts2d = struct.unpack_from("<Q", data, offset)[0]
+            pts_end = offset + 8 + num_pts2d * 24
+            if pts_end > len(data):
+                raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: truncated 2D point tracks")
+            new_leaf = by_image_id.get(int(image_id)) or by_stem.get(Path(old_name).stem)
+            if new_leaf is not None and "/" in old_name:
+                new_name = f"{old_name.rsplit('/', 1)[0]}/{new_leaf}"
+            else:
+                new_name = new_leaf or old_name
+            out_chunks.append(header_bytes)
+            out_chunks.append(new_name.encode("utf-8") + b"\x00")
+            out_chunks.append(data[offset:pts_end])
+            offset = pts_end
+        if offset != len(data):
+            raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: trailing bytes")
+    except (struct.error, UnicodeDecodeError) as exc:
+        raise StageExecutionError(f"Malformed COLMAP images.bin at {images_bin_path}: {exc}") from exc
+    images_bin_path.write_bytes(b"".join(out_chunks))
+
+
 def _export_rebuilt_scene(
     request: RebuildRequest, base_manifest: SceneManifest, updated: GaussianState, skip_set: set[int]
 ) -> SceneManifest:
     request.output_dir.mkdir(parents=True, exist_ok=True)
     shutil.copytree(request.base_dir / "sparse", request.output_dir / "sparse", dirs_exist_ok=True)
+    rebuilt_frames = _populate_rebuilt_media(request, base_manifest, skip_set)
+    _sync_colmap_images_bin_names(request.output_dir / "sparse" / "0" / "images.bin", rebuilt_frames)
     save_gaussian_state(request.output_dir, updated)
     return export_scene(
         ExportRequest(
@@ -539,7 +646,7 @@ def _export_rebuilt_scene(
             width=base_manifest.width,
             height=base_manifest.height,
             intrinsics=base_manifest.intrinsics.model_dump(),
-            frames=_apply_frame_exclusions(base_manifest.frames, skip_set),
+            frames=rebuilt_frames,
             test_every=request.test_every,
             pose_backend=base_manifest.pose_backend,
             T_viewer_from_colmap=base_manifest.T_viewer_from_colmap,

@@ -43,8 +43,17 @@ interface ManifestFrame {
   excluded?: boolean;
 }
 
-const DEFAULT_SEEDS = [101, 202, 303];
+const DEFAULT_SEEDS = [101, 202, 303, 404];
 const ACTIVE_EDIT_STATUSES = new Set(["segmenting", "tracking", "previewing", "rebuilding", "Edited"]);
+
+function resolveSeedKey(previewSeeds: Record<string, string>, chosenSeed: string): string | null {
+  if (chosenSeed in previewSeeds) return chosenSeed;
+  const bare = chosenSeed.replace(/^seed_/, "");
+  if (bare in previewSeeds) return bare;
+  const prefixed = `seed_${bare}`;
+  if (prefixed in previewSeeds) return prefixed;
+  return null;
+}
 
 function manifestImageSize(manifest?: Manifest): { width: number; height: number } {
   const width = typeof manifest?.width === "number" ? manifest.width : 640;
@@ -142,8 +151,16 @@ export default function EditStudio({
     () => (editSession?.base_version_id && editSession.base_version_id !== activeVersionId ? baseManifest : undefined) ?? manifest,
     [activeVersionId, baseManifest, editSession?.base_version_id, manifest],
   );
+  const viewerUnexcludedFrames = useMemo(() => unexcludedFramesFrom(manifest), [manifest]);
   const allFrames = useMemo(() => unexcludedFramesFrom(editManifest), [editManifest]);
   const frames = useMemo(() => registeredFramesFrom(manifest), [manifest]);
+  const pickerFrames = useMemo(() => (frames.length > 0 ? frames : viewerUnexcludedFrames), [frames, viewerUnexcludedFrames]);
+
+  useEffect(() => {
+    if (frames.length === 0 && viewerUnexcludedFrames.length > 0) {
+      setSelectionMode("2d");
+    }
+  }, [frames.length, viewerUnexcludedFrames.length]);
 
   useEffect(() => {
     const baseVersionId = editSession?.base_version_id;
@@ -164,10 +181,10 @@ export default function EditStudio({
   }, [activeVersionId, editSession?.base_version_id, projectId]);
 
   useEffect(() => {
-    if (frames.length > 0 && !frames.some((f) => f.frame_idx === pickerFrameIdx)) {
-      setPickerFrameIdx(frames[0]!.frame_idx);
+    if (pickerFrames.length > 0 && !pickerFrames.some((f) => f.frame_idx === pickerFrameIdx)) {
+      setPickerFrameIdx(pickerFrames[0]!.frame_idx);
     }
-  }, [frames, pickerFrameIdx]);
+  }, [pickerFrames, pickerFrameIdx]);
 
   const loadFrames = useCallback(async (targetEditId: string, page = 1) => {
     const data = await roomApi.editFrames(targetEditId, page);
@@ -237,15 +254,17 @@ export default function EditStudio({
         if (cancelled || !latest) return;
         setEditSession(latest);
         setMaskRevision((r) => r + 1);
-        const seeds = Object.keys(latest.preview_seeds ?? {});
+        const previewMap = latest.preview_seeds ?? {};
+        const seeds = Object.keys(previewMap);
         if (latest.status === "preview_ready" || (seeds.length > 0 && latest.status !== "previewing")) {
           if (pendingPreviewSigRef.current) {
             setPreviewSignature(pendingPreviewSigRef.current);
             pendingPreviewSigRef.current = null;
           }
         }
-        if (seeds.length > 0 && !seeds.includes(chosenSeed)) {
-          setChosenSeed(seeds[0]!);
+        if (seeds.length > 0) {
+          const matched = resolveSeedKey(previewMap, chosenSeed);
+          setChosenSeed(matched ?? seeds[0]!);
         }
         await loadFrames(editId, framesData?.page ?? 1).catch(() => undefined);
         if (latest.status && !ACTIVE_EDIT_STATUSES.has(latest.status)) {
@@ -286,7 +305,7 @@ export default function EditStudio({
 
   const handleJumpToPickerFrame = () => {
     onJumpToFrame?.(pickerFrameIdx);
-    const frame = frames.find((f) => f.frame_idx === pickerFrameIdx);
+    const frame = pickerFrames.find((f) => f.frame_idx === pickerFrameIdx);
     const pose = frame ? poseFromManifestFrame(frame) : null;
     if (pose) controller?.setCameraPose(pose);
   };
@@ -392,8 +411,8 @@ export default function EditStudio({
             }
           : undefined;
       const res = extraOpts
-        ? await roomApi.applyEdit(editId, chosenSeed, rebuildMode, prompt.trim(), extraOpts)
-        : await roomApi.applyEdit(editId, chosenSeed, rebuildMode, prompt.trim());
+        ? await roomApi.applyEdit(editId, selectedSeedValue, rebuildMode, prompt.trim(), extraOpts)
+        : await roomApi.applyEdit(editId, selectedSeedValue, rebuildMode, prompt.trim());
       setStatusMessage(`Rebuild queued for version ${res.target_version_id}`);
       setPollingEdit(true);
       notifyTasks();
@@ -415,7 +434,7 @@ export default function EditStudio({
         ? appendAuthTokenQuery(`${assetBaseUrl.replace(/\/+$/, "")}/${relpath.replace(/^\/+/, "")}`)
         : null
     : null;
-  const pickerRelpath = frameRelpathFor(frames, pickerFrameIdx);
+  const pickerRelpath = frameRelpathFor(pickerFrames, pickerFrameIdx);
   const pickerImageUrl = pickerRelpath
     ? activeVersionId
       ? sceneAssetUrl(projectId, activeVersionId, pickerRelpath)
@@ -426,13 +445,17 @@ export default function EditStudio({
   const refMaskKey = maskKeyFromSession(editSession, framesData, refFrameIdx);
   const previewSeeds = editSession?.preview_seeds ?? {};
   const previewEntries = Object.entries(previewSeeds);
-  const seedOptions = Array.from(new Set([...DEFAULT_SEEDS.map((s) => `seed_${s}`), ...Object.keys(previewSeeds)]));
+  const resolvedSeedKey = resolveSeedKey(previewSeeds, chosenSeed);
+  const selectedSeedValue = resolvedSeedKey ?? chosenSeed;
+  const seedOptions = previewEntries.length > 0
+    ? Object.keys(previewSeeds)
+    : DEFAULT_SEEDS.map((s) => `seed_${s}`);
   const stalePreviews = previewSignature !== null && previewSignature !== currentSignature;
   const applyDisabled =
     busy
     || stalePreviews
     || previewEntries.length === 0
-    || !previewSeeds[chosenSeed]
+    || !resolvedSeedKey
     || editSession?.status === "previewing";
 
   return (
@@ -463,7 +486,7 @@ export default function EditStudio({
           >
             {editMode ? "🎯 Edit Object Mode: ON (Selection Active)" : "✏️ Edit Object Mode: OFF (Click to Enable)"}
           </button>
-          {frames.length > 0 ? (
+          {pickerFrames.length > 0 ? (
             <button
               type="button"
               aria-pressed={selectionMode === "2d"}
@@ -476,7 +499,7 @@ export default function EditStudio({
         </div>
       </div>
 
-      {selectionMode === "2d" && frames.length > 0 ? (
+      {selectionMode === "2d" && pickerFrames.length > 0 ? (
         <div aria-label="2D Frame Picker" style={{ display: "grid", gap: "8px", border: "1px solid #334155", borderRadius: "8px", padding: "10px" }}>
           <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
             <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
@@ -486,7 +509,7 @@ export default function EditStudio({
                 value={pickerFrameIdx}
                 onChange={(e) => setPickerFrameIdx(Number(e.target.value))}
               >
-                {frames.map((frame) => (
+                {pickerFrames.map((frame) => (
                   <option key={frame.frame_idx} value={frame.frame_idx}>{`Frame #${frame.frame_idx}`}</option>
                 ))}
               </select>
@@ -638,7 +661,7 @@ export default function EditStudio({
 
               <label>
                 Seed:
-                <select aria-label="Chosen Diffusion Seed" value={chosenSeed} onChange={(e) => setChosenSeed(e.target.value)}>
+                <select aria-label="Chosen Diffusion Seed" value={selectedSeedValue} onChange={(e) => setChosenSeed(e.target.value)}>
                   {seedOptions.map((seed) => (
                     <option key={seed} value={seed}>{seed}</option>
                   ))}
@@ -661,9 +684,10 @@ export default function EditStudio({
             {Object.keys(previewSeeds).length > 0 ? (
               <SeedPreviewGallery
                 previewSeeds={previewSeeds}
-                selectedSeed={chosenSeed}
+                selectedSeed={selectedSeedValue}
                 referenceImageUrl={refImageUrl}
                 stale={stalePreviews}
+                cacheKey={maskRevision}
                 onSelectSeed={(seed) => setChosenSeed(seed)}
               />
             ) : null}

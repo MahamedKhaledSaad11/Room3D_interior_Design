@@ -8,16 +8,23 @@ export interface SeedPreviewGalleryProps {
   selectedSeed: string | null;
   referenceImageUrl: string | null;
   stale?: boolean;
+  cacheKey?: number | string;
   onSelectSeed: (seed: string) => void;
 }
 
 const thumbStyle: React.CSSProperties = { width: "100%", aspectRatio: "4/3", objectFit: "cover", borderRadius: "6px", display: "block" };
+
+function previewUrlWithVersion(key: string, cacheKey: number | string): string {
+  const url = storageKeyUrl(key);
+  return `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(String(cacheKey))}`;
+}
 
 export default function SeedPreviewGallery({
   previewSeeds,
   selectedSeed,
   referenceImageUrl,
   stale = false,
+  cacheKey = 0,
   onSelectSeed,
 }: SeedPreviewGalleryProps) {
   const [showOriginal, setShowOriginal] = useState(false);
@@ -40,7 +47,7 @@ export default function SeedPreviewGallery({
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "8px" }}>
         {entries.map(([seed, key]) => {
           const selected = seed === selectedSeed;
-          const src = showOriginal && referenceImageUrl ? referenceImageUrl : storageKeyUrl(key);
+          const src = showOriginal && referenceImageUrl ? referenceImageUrl : previewUrlWithVersion(key, cacheKey);
           return (
             <button
               key={seed}
@@ -51,7 +58,7 @@ export default function SeedPreviewGallery({
               style={{ padding: "4px", display: "grid", gap: "4px", borderColor: selected ? "#2dd4bf" : undefined, borderWidth: selected ? 2 : 1 }}
             >
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={src} alt={`Preview for ${seed}`} style={thumbStyle} />
+              <img src={src} alt={`Preview for ${seed}`} data-testid={`seed-preview-img-${seed}`} style={thumbStyle} />
               <span style={{ fontSize: "11px" }}>{seed}</span>
             </button>
           );

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import os
 import shutil
 import struct
@@ -23,7 +24,14 @@ from room3d_worker.common.coords import (
 from room3d_worker.common.errors import GeometryError, StageExecutionError
 from room3d_worker.common.manifest import SceneManifest
 
-BackendName = Literal["colmap_global", "colmap_incremental", "vggt_chunked", "map_anything"]
+BackendName = Literal[
+    "colmap_global",
+    "colmap_incremental",
+    "vggt_chunked",
+    "map_anything",
+    "mapanything",
+    "precomputed_colmap",
+]
 FloatMatrix = NDArray[np.float64]
 
 
@@ -1059,11 +1067,441 @@ class _DefaultVGGTRunner:
         )
 
 
+_COLMAP_CAMERA_MODELS: dict[int, tuple[str, int]] = {
+    0: ("SIMPLE_PINHOLE", 3),
+    1: ("PINHOLE", 4),
+    2: ("SIMPLE_RADIAL", 4),
+    3: ("RADIAL", 5),
+    4: ("OPENCV", 8),
+}
+
+
+def _qvec_to_rotmat(qvec: tuple[float, float, float, float]) -> NDArray[np.float64]:
+    q = np.asarray(qvec, dtype=np.float64)
+    norm = float(np.linalg.norm(q))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        raise ColmapFailureError("COLMAP quaternion has zero or non-finite norm")
+    w, x, y, z = (q / norm).tolist()
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
+        [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
+        [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def _read_colmap_cameras_bin(path: Path) -> dict[int, dict[str, Any]]:
+    if not path.is_file():
+        raise ColmapFailureError(f"Missing COLMAP cameras.bin at {path}")
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise ColmapFailureError(f"Truncated COLMAP cameras.bin at {path}")
+    header_size = struct.calcsize("<IiQQ")
+    num_cameras = struct.unpack_from("<Q", data, 0)[0]
+    offset = 8
+    cameras: dict[int, dict[str, Any]] = {}
+    for _ in range(num_cameras):
+        if offset + header_size > len(data):
+            raise ColmapFailureError(f"Truncated camera header in {path}")
+        cam_id, model_id, width, height = struct.unpack_from("<IiQQ", data, offset)
+        offset += header_size
+        spec = _COLMAP_CAMERA_MODELS.get(model_id)
+        if spec is None:
+            raise ColmapFailureError(f"Unsupported COLMAP camera model_id={model_id} in {path}")
+        model_name, num_params = spec
+        param_bytes = num_params * 8
+        if offset + param_bytes > len(data):
+            raise ColmapFailureError(f"Truncated camera params in {path}")
+        params = list(struct.unpack_from(f"<{num_params}d", data, offset))
+        offset += param_bytes
+        if model_name in {"SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"}:
+            fx = fy = float(params[0])
+            cx, cy = float(params[1]), float(params[2])
+            dist_coeffs = [float(v) for v in params[3:]]
+        else:
+            fx, fy, cx, cy = (float(params[i]) for i in range(4))
+            dist_coeffs = [float(v) for v in params[4:]]
+        if width <= 0 or height <= 0 or not all(np.isfinite(val) for val in params) or min(fx, fy) <= 0.0:
+            raise ColmapFailureError(f"Camera {cam_id} has non-finite or non-positive parameters in {path}")
+        if any((not np.isfinite(coeff)) or abs(coeff) > 1e-8 for coeff in dist_coeffs):
+            raise ColmapFailureError(
+                f"Camera {cam_id} ({model_name}) has non-zero distortion {dist_coeffs}; undistorted PINHOLE input is required"
+            )
+        cameras[int(cam_id)] = {
+            "camera_id": int(cam_id),
+            "model_id": int(model_id),
+            "model": model_name,
+            "width": int(width),
+            "height": int(height),
+            "params": params,
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+        }
+    return cameras
+
+
+def _read_colmap_images_bin(path: Path) -> dict[int, dict[str, Any]]:
+    if not path.is_file():
+        raise ColmapFailureError(f"Missing COLMAP images.bin at {path}")
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise ColmapFailureError(f"Truncated COLMAP images.bin at {path}")
+    header_size = struct.calcsize("<I4d3dI")
+    num_images = struct.unpack_from("<Q", data, 0)[0]
+    offset = 8
+    images: dict[int, dict[str, Any]] = {}
+    for _ in range(num_images):
+        if offset + header_size > len(data):
+            raise ColmapFailureError(f"Truncated image header in {path}")
+        image_id, qw, qx, qy, qz, tx, ty, tz, camera_id = struct.unpack_from("<I4d3dI", data, offset)
+        offset += header_size
+        try:
+            nul = data.index(0, offset)
+        except ValueError as exc:
+            raise ColmapFailureError(f"Unterminated image name in {path}") from exc
+        name = data[offset:nul].decode("utf-8")
+        offset = nul + 1
+        if offset + 8 > len(data):
+            raise ColmapFailureError(f"Truncated point2D count in {path}")
+        num_pts2d = struct.unpack_from("<Q", data, offset)[0]
+        offset += 8 + num_pts2d * 24
+        if offset > len(data):
+            raise ColmapFailureError(f"Truncated point2D entries in {path}")
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = _qvec_to_rotmat((qw, qx, qy, qz))
+        pose[:3, 3] = [tx, ty, tz]
+        images[int(image_id)] = {
+            "image_id": int(image_id),
+            "camera_id": int(camera_id),
+            "name": name,
+            "cam_from_world": pose.tolist(),
+        }
+    return images
+
+
+def _read_colmap_points3d_bin(path: Path) -> tuple[NDArray[np.float64], NDArray[np.uint8]]:
+    if not path.is_file():
+        raise ColmapFailureError(f"Missing COLMAP points3D.bin at {path}")
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise ColmapFailureError(f"Truncated COLMAP points3D.bin at {path}")
+    header_size = struct.calcsize("<Q3d3BdQ")
+    num_pts = struct.unpack_from("<Q", data, 0)[0]
+    offset = 8
+    xyz_list: list[tuple[float, float, float]] = []
+    rgb_list: list[tuple[int, int, int]] = []
+    for _ in range(num_pts):
+        if offset + header_size > len(data):
+            raise ColmapFailureError(f"Truncated point3D header in {path}")
+        _, x, y, z, r, g, b, _, track_len = struct.unpack_from("<Q3d3BdQ", data, offset)
+        offset += header_size + track_len * 8
+        if offset > len(data):
+            raise ColmapFailureError(f"Truncated point3D track in {path}")
+        xyz_list.append((x, y, z))
+        rgb_list.append((r, g, b))
+    if not xyz_list:
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.uint8)
+    return np.asarray(xyz_list, dtype=np.float64), np.asarray(rgb_list, dtype=np.uint8)
+
+
+def _write_sparse_points_json(path: Path, points_xyz: NDArray[np.float64], points_rgb: NDArray[np.uint8]) -> None:
+    step = max(1, len(points_xyz) // 100_000)
+    payload = [
+        {
+            "position": [float(v) for v in pt],
+            "x": float(pt[0]),
+            "y": float(pt[1]),
+            "z": float(pt[2]),
+            "color": [int(c) for c in clr],
+        }
+        for pt, clr in zip(points_xyz[::step], points_rgb[::step])
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
+def _scale_and_crop_intrinsics(
+    old_w: int,
+    old_h: int,
+    fx_old: float,
+    fy_old: float,
+    cx_old: float,
+    cy_old: float,
+    target_w: int,
+    target_h: int,
+) -> tuple[int, int, float, float, float, float, tuple[int, int, int, int]]:
+    scale_x = target_w / float(old_w)
+    scale_y = target_h / float(old_h)
+    return mod16_crop_or_pad_params(
+        target_w,
+        target_h,
+        cx_old * scale_x,
+        cy_old * scale_y,
+        fx_old * scale_x,
+        fy_old * scale_y,
+    )
+
+
+def _resolve_single_calibration_camera(
+    cameras: dict[int, dict[str, Any]],
+    sorted_imgs: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    referenced_ids: list[int] = []
+    seen: set[int] = set()
+    for img in sorted_imgs:
+        cid = int(img["camera_id"])
+        if cid not in cameras:
+            raise ColmapFailureError(f"Image {img.get('name', img.get('image_id'))} references missing camera_id={cid}")
+        if cid not in seen:
+            seen.add(cid)
+            referenced_ids.append(cid)
+    if not referenced_ids:
+        return next(iter(cameras.values()))
+    ref = cameras[referenced_ids[0]]
+    for cid in referenced_ids[1:]:
+        other = cameras[cid]
+        if int(other["width"]) != int(ref["width"]) or int(other["height"]) != int(ref["height"]):
+            raise ColmapFailureError(
+                "Precomputed COLMAP scene contains multiple cameras with incompatible intrinsics or dimensions"
+            )
+        if any(abs(float(other[k]) - float(ref[k])) > 1e-4 for k in ("fx", "fy", "cx", "cy")):
+            raise ColmapFailureError(
+                "Precomputed COLMAP scene contains multiple cameras with incompatible intrinsics or dimensions"
+            )
+    return ref
+
+
+def _resolve_precomputed_image(image_root: Path, colmap_name: str) -> Path:
+    candidates = [image_root / colmap_name, image_root / Path(colmap_name).name]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise ColmapFailureError(f"Missing precomputed COLMAP source image {colmap_name} under {image_root}")
+
+
+class PrecomputedColmapBackend:
+    """Adapter for datasets that already provide sparse/0/{cameras,images,points3D}.bin."""
+
+    def _locate_sparse_dir(self, request: PoseRequest) -> Path:
+        candidates = (
+            request.image_dir / "sparse" / "0",
+            request.image_dir.parent / "sparse" / "0",
+            request.output_dir / "sparse" / "0",
+        )
+        for cand in candidates:
+            if (cand / "cameras.bin").is_file() and (cand / "images.bin").is_file() and (cand / "points3D.bin").is_file():
+                return cand
+        raise ColmapFailureError(f"Could not find sparse/0 COLMAP binary files near {request.image_dir}")
+
+    def _detect_image_size(self, request: PoseRequest, fallback: tuple[int, int]) -> tuple[int, int]:
+        candidates = _ordered_request_images(request) if request.image_dir.is_dir() else []
+        for path in candidates:
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                with Image.open(path) as handle:
+                    return handle.size
+        return fallback
+
+    def estimate(self, request: PoseRequest) -> BackendOutput:
+        src_sparse = self._locate_sparse_dir(request)
+        cameras = _read_colmap_cameras_bin(src_sparse / "cameras.bin")
+        images_bin = _read_colmap_images_bin(src_sparse / "images.bin")
+        points_xyz, points_rgb = _read_colmap_points3d_bin(src_sparse / "points3D.bin")
+        if not cameras or len(images_bin) < 2 or len(points_xyz) == 0:
+            raise ColmapFailureError("Precomputed COLMAP reconstruction requires >=2 images and non-empty points3D")
+
+        sorted_imgs = sorted(images_bin.values(), key=lambda item: int(item["image_id"]))
+        cam = _resolve_single_calibration_camera(cameras, sorted_imgs)
+        actual_w, actual_h = self._detect_image_size(request, (request.width, request.height))
+        final_w, final_h, final_fx, final_fy, final_cx, final_cy, crop_box = _scale_and_crop_intrinsics(
+            int(cam["width"]),
+            int(cam["height"]),
+            float(cam["fx"]),
+            float(cam["fy"]),
+            float(cam["cx"]),
+            float(cam["cy"]),
+            actual_w,
+            actual_h,
+        )
+        calibrated = {"fx": final_fx, "fy": final_fy, "cx": final_cx, "cy": final_cy}
+
+        by_name = {Path(str(img["name"])).name: img for img in sorted_imgs}
+        frames: list[dict[str, Any]] = []
+        cam_positions: list[NDArray[np.float64]] = []
+        registered_count = 0
+        if request.frame_records:
+            for fr in request.frame_records:
+                rec = dict(fr)
+                matched = by_name.get(Path(str(fr["image_relpath"])).name)
+                if matched is not None:
+                    pose_arr = np.asarray(matched["cam_from_world"], dtype=np.float64)
+                    cam_positions.append(-(pose_arr[:3, :3].T @ pose_arr[:3, 3]))
+                    rec["colmap_image_id"] = int(matched["image_id"])
+                    rec["cam_from_world"] = matched["cam_from_world"]
+                    registered_count += 1
+                else:
+                    rec["colmap_image_id"] = None
+                    rec["cam_from_world"] = None
+                frames.append(rec)
+        else:
+            for idx, img in enumerate(sorted_imgs):
+                pose_arr = np.asarray(img["cam_from_world"], dtype=np.float64)
+                cam_positions.append(-(pose_arr[:3, :3].T @ pose_arr[:3, 3]))
+                frames.append({
+                    "frame_idx": idx,
+                    "orig_video_frame": idx,
+                    "timestamp_sec": float(idx),
+                    "image_relpath": f"images/{Path(str(img['name'])).name}",
+                    "colmap_image_id": int(img["image_id"]),
+                    "cam_from_world": img["cam_from_world"],
+                })
+            registered_count = len(frames)
+
+        if registered_count < 2:
+            raise ColmapFailureError(f"Precomputed COLMAP matched only {registered_count} frame(s); >=2 required")
+
+        _publish_mod16_images([request.image_dir], request.output_dir, frames, actual_w, actual_h, crop_box)
+        sparse_dir = request.output_dir / "sparse" / "0"
+        write_colmap_binary(sparse_dir, final_w, final_h, calibrated, frames, points_xyz, points_rgb)
+        _write_sparse_points_json(request.output_dir / "sparse_points.json", points_xyz, points_rgb)
+
+        return BackendOutput(
+            registered_frames=registered_count,
+            mean_reproj_px=0.5,
+            num_points3d=len(points_xyz),
+            points_xyz=points_xyz,
+            cam_positions_xyz=np.asarray(cam_positions, dtype=np.float64),
+            frames=frames,
+            sparse_dir=sparse_dir,
+            width=final_w,
+            height=final_h,
+            intrinsics=calibrated,
+        )
+
+
+def prepare_precomputed_colmap_scene(
+    source_scene_dir: Path,
+    output_dir: Path,
+    *,
+    project_id: str,
+    version_id: str,
+    max_long_side: int = 960,
+    manifest_path: Path | None = None,
+) -> tuple[SceneManifest, PoseTelemetry]:
+    """Resize precomputed COLMAP images to mod-16 long-side and update intrinsics + binaries."""
+    started = time.perf_counter()
+    if max_long_side < 64:
+        raise ValueError(f"max_long_side must be >= 64, got {max_long_side}")
+    src_sparse = source_scene_dir / "sparse" / "0"
+    src_images_dir = source_scene_dir / "images"
+    cameras = _read_colmap_cameras_bin(src_sparse / "cameras.bin")
+    images_bin = _read_colmap_images_bin(src_sparse / "images.bin")
+    points_xyz, points_rgb = _read_colmap_points3d_bin(src_sparse / "points3D.bin")
+    if not cameras or len(images_bin) < 2 or len(points_xyz) == 0:
+        raise ColmapFailureError(f"Precomputed scene at {source_scene_dir} lacks valid cameras, >=2 images, or points3D")
+
+    sorted_imgs = sorted(images_bin.values(), key=lambda item: int(item["image_id"]))
+    cam = _resolve_single_calibration_camera(cameras, sorted_imgs)
+    old_w, old_h = int(cam["width"]), int(cam["height"])
+    if max(old_w, old_h) > max_long_side:
+        scale = max_long_side / float(max(old_w, old_h))
+        resized_w = max(16, int(round(old_w * scale)))
+        resized_h = max(16, int(round(old_h * scale)))
+    else:
+        resized_w, resized_h = old_w, old_h
+
+    final_w, final_h, final_fx, final_fy, final_cx, final_cy, crop_box = _scale_and_crop_intrinsics(
+        old_w,
+        old_h,
+        float(cam["fx"]),
+        float(cam["fy"]),
+        float(cam["cx"]),
+        float(cam["cy"]),
+        resized_w,
+        resized_h,
+    )
+    calibrated = {"fx": final_fx, "fy": final_fy, "cx": final_cx, "cy": final_cy}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_images_dir = output_dir / "images"
+    out_images_dir.mkdir(parents=True, exist_ok=True)
+
+    frames: list[dict[str, Any]] = []
+    cam_positions: list[NDArray[np.float64]] = []
+    for idx, img in enumerate(sorted_imgs):
+        src_img_path = _resolve_precomputed_image(src_images_dir, str(img["name"]))
+        out_name = Path(str(img["name"])).name
+        dst_img_path = out_images_dir / out_name
+        with Image.open(src_img_path) as handle:
+            rgb_img = handle.convert("RGB")
+            if rgb_img.size != (resized_w, resized_h):
+                rgb_img = rgb_img.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+            if crop_box != (0, 0, resized_w, resized_h):
+                rgb_img = rgb_img.crop(crop_box)
+            rgb_img.save(dst_img_path)
+        pose_arr = np.asarray(img["cam_from_world"], dtype=np.float64)
+        cam_positions.append(-(pose_arr[:3, :3].T @ pose_arr[:3, 3]))
+        frames.append({
+            "frame_idx": idx,
+            "orig_video_frame": idx,
+            "timestamp_sec": float(idx),
+            "image_relpath": f"images/{out_name}",
+            "colmap_image_id": int(img["image_id"]),
+            "cam_from_world": img["cam_from_world"],
+        })
+
+    sparse_dir = output_dir / "sparse" / "0"
+    write_colmap_binary(sparse_dir, final_w, final_h, calibrated, frames, points_xyz, points_rgb)
+    _write_sparse_points_json(output_dir / "sparse_points.json", points_xyz, points_rgb)
+
+    cams_arr = np.asarray(cam_positions, dtype=np.float64)
+    transform = align_gravity_up(points_xyz, cams_arr)
+    runtime_sec = time.perf_counter() - started
+    peak_vram_mb = _peak_vram_mb()
+    metrics = {
+        "registered_frames": len(frames),
+        "total_frames": len(frames),
+        "mean_reproj_px": 0.5,
+        "num_points3d": len(points_xyz),
+        "runtime_sec": runtime_sec,
+        "peak_vram_mb": peak_vram_mb,
+    }
+    manifest = SceneManifest.model_validate({
+        "schema_version": "1.0.0",
+        "project_id": project_id,
+        "version_id": version_id,
+        "coord_convention": "opencv_colmap",
+        "T_viewer_from_colmap": transform.tolist(),
+        "camera_model": "PINHOLE",
+        "width": final_w,
+        "height": final_h,
+        "intrinsics": calibrated,
+        "test_every": 0,
+        "pose_backend": "precomputed_colmap",
+        "frames": frames,
+        "artifacts": {
+            "sparse_dir": "sparse/0",
+            "spz_relpath": "scene.spz",
+            "sparse_points_relpath": "sparse_points.json",
+        },
+        "metrics": metrics,
+    })
+    serialized = manifest.model_dump_json(indent=2) + "\n"
+    (output_dir / "manifest.json").write_text(serialized, encoding="utf-8")
+    if manifest_path is not None and manifest_path.resolve() != (output_dir / "manifest.json").resolve():
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(serialized, encoding="utf-8")
+
+    telemetry = PoseTelemetry(len(frames), len(frames), 0.5, len(points_xyz), runtime_sec, peak_vram_mb)
+    return manifest, telemetry
+
+
 def _default_backends() -> dict[BackendName, PoseBackend]:
     return {
         "colmap_global": PyColmapBackend("global"),
         "colmap_incremental": PyColmapBackend("incremental"),
         "vggt_chunked": VGGTChunkedBackend(_DefaultVGGTRunner()),
+        "precomputed_colmap": PrecomputedColmapBackend(),
     }
 
 

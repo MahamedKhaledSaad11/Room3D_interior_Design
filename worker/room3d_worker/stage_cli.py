@@ -93,6 +93,10 @@ def _diffusion_cfg(spec: dict[str, Any], *, grid_2x2: bool = True) -> DiffusionC
     }
     if "negative_prompt" in sig.parameters and spec.get("negative_prompt"):
         kwargs["negative_prompt"] = str(spec["negative_prompt"])
+    if "quantization" in sig.parameters:
+        kwargs["quantization"] = str(spec.get("quantization") or "nf4")
+    if "offload_text_encoder" in sig.parameters:
+        kwargs["offload_text_encoder"] = bool(spec.get("offload_text_encoder", True))
     return DiffusionConfig(**kwargs)
 
 
@@ -104,6 +108,25 @@ def run_extract_stage(spec: dict[str, Any]) -> dict[str, Any]:
 def run_poses_stage(spec: dict[str, Any]) -> dict[str, Any]:
     out_dir = Path(spec["output_dir"])
     manifest_path = Path(spec.get("manifest_path") or (out_dir / "manifest.json"))
+    if spec.get("pose_backend") == "precomputed_colmap" and spec.get("source_scene_dir"):
+        from room3d_worker.pipeline import s02_poses
+
+        prepare_fn = getattr(s02_poses, "prepare_precomputed_colmap_scene", None)
+        if prepare_fn is None:
+            raise StageExecutionError("prepare_precomputed_colmap_scene is not available in s02_poses")
+        manifest, telemetry = prepare_fn(
+            Path(spec["source_scene_dir"]),
+            out_dir,
+            project_id=str(spec["project_id"]),
+            version_id=str(spec["version_id"]),
+            max_long_side=int(spec.get("max_long_side", 960)),
+            manifest_path=manifest_path,
+        )
+        return {
+            "manifest_path": str(manifest_path),
+            "registered_frames": telemetry.registered_frames,
+            "version_id": manifest.version_id,
+        }
     req = PoseRequest(
         image_dir=Path(spec["image_dir"]),
         output_dir=out_dir,

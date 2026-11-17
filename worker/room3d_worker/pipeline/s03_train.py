@@ -236,12 +236,24 @@ def _load_manifest(work_dir: Path, manifest: Any | None) -> Any | None:
     return load_manifest(manifest_path)
 
 
+def _resolved_intrinsics(manifest: Any, actual_w: int, actual_h: int) -> tuple[float, float, float, float]:
+    """Scale manifest PINHOLE intrinsics when training images differ from manifest dimensions."""
+    intr = manifest.intrinsics
+    if actual_w <= 0 or actual_h <= 0:
+        raise GeometryError("Training image dimensions must be positive")
+    if actual_w == int(manifest.width) and actual_h == int(manifest.height):
+        return float(intr.fx), float(intr.fy), float(intr.cx), float(intr.cy)
+    sx = float(actual_w) / float(manifest.width)
+    sy = float(actual_h) / float(manifest.height)
+    return float(intr.fx) * sx, float(intr.fy) * sy, float(intr.cx) * sx, float(intr.cy) * sy
+
+
 def _extract_training_views(work_dir: Path, manifest: Any | None, images: Any) -> list[dict[str, Any]]:
     if manifest is None:
         return []
     views: list[dict[str, Any]] = []
-    intr = manifest.intrinsics
-    k_mat = np.array([[intr.fx, 0.0, intr.cx], [0.0, intr.fy, intr.cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+    img_arr = np.asarray(images) if images is not None else None
+    fallback_hw = (int(img_arr.shape[1]), int(img_arr.shape[2])) if img_arr is not None and img_arr.ndim == 4 and len(img_arr) > 0 else None
     frames = manifest.frames
     for idx, frame in enumerate(frames):
         if getattr(frame, "excluded", False) or getattr(frame, "cam_from_world", None) is None:
@@ -252,18 +264,23 @@ def _extract_training_views(work_dir: Path, manifest: Any | None, images: Any) -
         if img_path is not None:
             with Image.open(img_path) as img:
                 rgb = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-        elif isinstance(images, np.ndarray) and images.ndim == 4 and idx < len(images):
-            arr = images[idx].astype(np.float32)
+        elif img_arr is not None and img_arr.ndim == 4 and idx < len(img_arr):
+            arr = img_arr[idx].astype(np.float32)
             rgb = arr / 255.0 if arr.max(initial=0.0) > 1.5 else arr
         else:
             continue
+        actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
+        if fallback_hw is not None and (actual_h, actual_w) != fallback_hw and img_path is None:
+            actual_h, actual_w = fallback_hw
+        fx, fy, cx, cy = _resolved_intrinsics(manifest, actual_w, actual_h)
+        k_mat = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
         views.append({
             "frame_idx": int(frame.frame_idx),
             "viewmat": np.asarray(frame.cam_from_world, dtype=np.float32),
             "K": k_mat,
             "rgb": rgb,
-            "width": int(manifest.width),
-            "height": int(manifest.height),
+            "width": actual_w,
+            "height": actual_h,
         })
     return views
 

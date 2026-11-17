@@ -27,10 +27,12 @@ frontend/test-results/
 *.key
 
 # Local Storage, Data & Heavy Artifacts
+.local_data/
 data/
 storage_local/
 artifacts/
 runs/
+*.zip
 *.ply
 *.splat
 *.ksplat
@@ -57,3 +59,5 @@ scratch/
 /tasks/
 /db/
 /tests/
+/worker/tests/
+/kaggle_bundle/room3d_dataset.zip

@@ -45,15 +45,22 @@ const joinUrl = (base: string, path: string): string => {
   return appendAuthTokenQuery(joined);
 };
 
+export function applyViewerTransform(
+  target: THREE.Object3D,
+  viewerFromColmap?: readonly (readonly number[])[],
+): void {
+  const flat = viewerFromColmap?.flat();
+  if (!flat || flat.length !== 16 || !flat.every(Number.isFinite)) return;
+  // Matrix4.fromArray is column-major, so transpose the row-major manifest matrix.
+  target.matrix.fromArray(flat).transpose();
+  target.matrixAutoUpdate = false;
+  target.matrixWorldNeedsUpdate = true;
+}
+
 export function createSceneRoot(viewerFromColmap?: readonly (readonly number[])[]): THREE.Group {
   const root = new THREE.Group();
   root.name = "sceneRoot";
-  const flat = viewerFromColmap?.flat();
-  if (!flat || flat.length !== 16 || !flat.every(Number.isFinite)) return root;
-  // Matrix4.fromArray is column-major, so transpose the row-major manifest matrix.
-  root.matrix.fromArray(flat).transpose();
-  root.matrixAutoUpdate = false;
-  root.matrixWorldNeedsUpdate = true;
+  applyViewerTransform(root, viewerFromColmap);
   return root;
 }
 
@@ -165,7 +172,7 @@ export async function loadSplats(
 ): Promise<SplatLoadResult> {
   const artifacts = manifest.artifacts ?? {};
   const base = options.baseUrl ?? "";
-  const sceneRoot = createSceneRoot(options.viewerFromColmap);
+  const sceneRoot = createSceneRoot(options.viewerFromColmap ?? manifest.T_viewer_from_colmap);
   scene.add(sceneRoot);
   let collision: THREE.Object3D | null = null;
   if (artifacts.collision_glb_relpath) {
@@ -174,6 +181,7 @@ export async function loadSplats(
       sceneRoot,
       options.showCollision ?? false,
     );
+    if (collision) sceneRoot.updateMatrixWorld(true);
   }
 
   const url = artifacts.spz_relpath
@@ -193,6 +201,7 @@ export async function loadSplats(
       const splatCount = mesh.splats?.getNumSplats() ?? mesh.packedSplats?.numSplats ?? 0;
       scene.add(sparkRenderer);
       sceneRoot.add(mesh);
+      sceneRoot.updateMatrixWorld(true);
       return { mode: "spark", object: mesh, sparkRenderer, count: splatCount, collision, proxyMesh: collision, sceneRoot };
     } catch (error) {
       mesh?.dispose?.();
@@ -209,6 +218,7 @@ export async function loadSplats(
   const group = new THREE.Group();
   const count = await loadPoints(joinUrl(base, artifacts.sparse_points_relpath), group);
   sceneRoot.add(group);
+  sceneRoot.updateMatrixWorld(true);
   return { mode: "points", object: group, sparkRenderer: null, count, collision, proxyMesh: collision, sceneRoot };
 }
 

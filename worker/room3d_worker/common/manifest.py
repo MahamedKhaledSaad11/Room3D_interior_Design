@@ -100,7 +100,14 @@ class SceneManifest(StrictModel):
     @field_validator("pose_backend")
     @classmethod
     def validate_backend(cls, value: str | None) -> str | None:
-        allowed = {"colmap_global", "colmap_incremental", "vggt_chunked", "map_anything"}
+        allowed = {
+            "colmap_global",
+            "colmap_incremental",
+            "vggt_chunked",
+            "map_anything",
+            "mapanything",
+            "precomputed_colmap",
+        }
         if value is not None and value not in allowed:
             raise ValueError(f"pose_backend must be one of {sorted(allowed)}")
         return value

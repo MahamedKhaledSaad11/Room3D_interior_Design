@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { describe, expect, it } from "vitest";
 import { getAuthToken, sceneAssetUrl, setAuthToken, storageKeyUrl } from "@/lib/api";
 import { applyMatrix4RowMajor, invertRigid4x4 } from "@/lib/cameraMath";
-import { createSceneRoot } from "@/lib/splatLoader";
+import { applyViewerTransform, createSceneRoot } from "@/lib/splatLoader";
 
 describe("scene root & storage URL helpers", () => {
   it("applies row-major T_viewer_from_colmap once to sceneRoot", () => {
@@ -28,6 +28,24 @@ describe("scene root & storage URL helpers", () => {
   it("keeps identity sceneRoot when T_viewer_from_colmap is missing or invalid", () => {
     const root = createSceneRoot(undefined);
     expect(root.matrix.equals(new THREE.Matrix4())).toBe(true);
+  });
+
+  it("applies T_viewer_from_colmap directly via applyViewerTransform and updates child matrixWorld", () => {
+    const tViewerFromColmap = [
+      [1, 0, 0, 0],
+      [0, -1, 0, 2],
+      [0, 0, -1, 5],
+      [0, 0, 0, 1],
+    ];
+    const root = new THREE.Group();
+    const child = new THREE.Object3D();
+    root.add(child);
+    applyViewerTransform(root, tViewerFromColmap);
+    root.updateMatrixWorld(true);
+
+    expect(root.matrixAutoUpdate).toBe(false);
+    const transformed = new THREE.Vector3(1, 3, 4).applyMatrix4(child.matrixWorld);
+    expect(transformed.toArray()).toEqual([1, -1, 1]);
   });
 
   it("builds storageKeyUrl without double-prefixing", () => {

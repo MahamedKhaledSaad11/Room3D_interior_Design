@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import os
 import tempfile
 import time
 from collections import OrderedDict
@@ -585,6 +586,11 @@ def load_sam2_backends(model_cfg: str, checkpoint: str, device: str = "cuda:1") 
     except ImportError as exc:
         raise StageExecutionError("s05_track requires torch and sam2 when loading live SAM 2.1 weights") from exc
     resolved = _resolve_sam_device(device, torch)
-    sam_model = sam2_build.build_sam2(model_cfg, checkpoint, device=resolved)
-    video_predictor = sam2_build.build_sam2_video_predictor(model_cfg, checkpoint, device=resolved)
+    if not checkpoint and hasattr(sam2_build, "build_sam2_hf") and hasattr(sam2_build, "build_sam2_video_predictor_hf"):
+        hf_id = os.environ.get("ROOM3D_SAM2_HF_MODEL", "facebook/sam2.1-hiera-small")
+        sam_model = sam2_build.build_sam2_hf(hf_id, device=resolved)
+        video_predictor = sam2_build.build_sam2_video_predictor_hf(hf_id, device=resolved)
+    else:
+        sam_model = sam2_build.build_sam2(model_cfg, checkpoint, device=resolved)
+        video_predictor = sam2_build.build_sam2_video_predictor(model_cfg, checkpoint, device=resolved)
     return _Sam2Interactive(sam2_pred.SAM2ImagePredictor(sam_model)), _Sam2Video(video_predictor)
