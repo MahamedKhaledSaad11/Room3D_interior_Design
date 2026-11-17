@@ -314,6 +314,33 @@ def _compute_ssim(torch: Any, gsplat: Any, pred: Any, target: Any) -> Any:
     return ((2 * mu_x * mu_y + c1) * (2 * cov + c2)) / ((mu_x**2 + mu_y**2 + c1) * (vx + vy + c2) + 1e-8)
 
 
+def _make_optimizer(opt_cls: Any, torch: Any, param: Any, lr: float, name: str) -> Any:
+    param_groups = [{"params": [param], "lr": lr, "name": name}]
+    sig = inspect.signature(opt_cls.__init__ if inspect.isclass(opt_cls) else opt_cls).parameters
+    if opt_cls is not torch.optim.Adam and "lr" not in sig:
+        kwargs: dict[str, Any] = {}
+        if "eps" in sig:
+            kwargs["eps"] = 1e-15
+        if "betas" in sig:
+            kwargs["betas"] = (0.9, 0.999)
+        return opt_cls(param_groups, **kwargs)
+    if "eps" in sig:
+        return opt_cls(param_groups, eps=1e-15)
+    return opt_cls(param_groups)
+
+
+def _visible_gaussian_mask(info: Any) -> Any | None:
+    if not isinstance(info, dict) or "radii" not in info:
+        return None
+    radii = info["radii"]
+    visible = radii > 0
+    if visible.ndim == 3:
+        visible = visible.all(-1)
+    if visible.ndim >= 2:
+        visible = visible.any(0)
+    return visible
+
+
 def _optimize_with_gsplat(
     config: TrainConfig,
     state: GaussianModelState,
@@ -330,21 +357,25 @@ def _optimize_with_gsplat(
     quats = torch.nn.Parameter(torch.as_tensor(state.quats, dtype=torch.float32, device=device))
     logit_op = torch.nn.Parameter(torch.logit(torch.as_tensor(state.opacities, dtype=torch.float32, device=device).clamp(1e-4, 1.0 - 1e-4)))
     colors_p = torch.nn.Parameter(torch.as_tensor(state.sh0, dtype=torch.float32, device=device))
-    params = {"means": means, "scales": log_scales, "quats": quats, "opacities": logit_op, "sh0": colors_p}
+    params = torch.nn.ParameterDict({"means": means, "scales": log_scales, "quats": quats, "opacities": logit_op, "sh0": colors_p})
     selective_cls = getattr(getattr(gsplat, "optimizers", gsplat), "SelectiveAdam", None) or getattr(
         getattr(gsplat, "strategy", gsplat), "SelectiveAdam", None
     )
     opt_cls = selective_cls if selective_cls is not None else torch.optim.Adam
     optimizers = {
-        "means": opt_cls([means], lr=config.lr_means),
-        "scales": opt_cls([log_scales], lr=5e-3),
-        "quats": opt_cls([quats], lr=1e-3),
-        "opacities": opt_cls([logit_op], lr=5e-2),
-        "sh0": opt_cls([colors_p], lr=2.5e-3),
+        "means": _make_optimizer(opt_cls, torch, means, config.lr_means, "means"),
+        "scales": _make_optimizer(opt_cls, torch, log_scales, 5e-3, "scales"),
+        "quats": _make_optimizer(opt_cls, torch, quats, 1e-3, "quats"),
+        "opacities": _make_optimizer(opt_cls, torch, logit_op, 5e-2, "opacities"),
+        "sh0": _make_optimizer(opt_cls, torch, colors_p, 2.5e-3, "sh0"),
     }
     strategy = _build_mcmc_strategy(gsplat, config)
+    if strategy is not None and hasattr(strategy, "check_sanity"):
+        strategy.check_sanity(params, optimizers)
     strategy_state = strategy.initialize_state() if strategy is not None and hasattr(strategy, "initialize_state") else None
+    pre_sig = inspect.signature(strategy.step_pre_backward).parameters if strategy is not None and hasattr(strategy, "step_pre_backward") else {}
     post_sig = inspect.signature(strategy.step_post_backward).parameters if strategy is not None and hasattr(strategy, "step_post_backward") else {}
+    use_absgrad = bool(getattr(strategy, "absgrad", False))
     last_psnr, last_ssim = 0.0, 0.0
     for step in range(config.iterations):
         view = views[step % len(views)]
@@ -355,12 +386,15 @@ def _optimize_with_gsplat(
         viewmat = torch.as_tensor(view["viewmat"], dtype=torch.float32, device=device).unsqueeze(0)
         k_mat = torch.as_tensor(view["K"], dtype=torch.float32, device=device).unsqueeze(0)
         target = torch.as_tensor(view["rgb"], dtype=torch.float32, device=device)
-        out = rasterize(
-            means=means, quats=quats / quats.norm(dim=-1, keepdim=True).clamp(min=1e-8),
-            scales=torch.exp(log_scales), opacities=torch.sigmoid(logit_op),
-            colors=colors_p.clamp(0.0, 1.0), viewmats=viewmat, Ks=k_mat,
-            width=view["width"], height=view["height"], packed=False,
-        )
+        raster_kwargs: dict[str, Any] = {
+            "means": means, "quats": quats / quats.norm(dim=-1, keepdim=True).clamp(min=1e-8),
+            "scales": torch.exp(log_scales), "opacities": torch.sigmoid(logit_op),
+            "colors": colors_p.clamp(0.0, 1.0), "viewmats": viewmat, "Ks": k_mat,
+            "width": view["width"], "height": view["height"], "packed": False,
+        }
+        if use_absgrad:
+            raster_kwargs["absgrad"] = True
+        out = rasterize(**raster_kwargs)
         rendered = out[0] if isinstance(out, tuple) else out
         info = out[2] if isinstance(out, tuple) and len(out) > 2 else {}
         pred = rendered[0].clamp(0.0, 1.0)
@@ -368,16 +402,20 @@ def _optimize_with_gsplat(
         ssim_val = _compute_ssim(torch, gsplat, pred, target)
         loss = 0.8 * l1 + 0.2 * (1.0 - ssim_val)
         if strategy is not None and strategy_state is not None and hasattr(strategy, "step_pre_backward"):
-            strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
+            pre_args: dict[str, Any] = {}
+            if "packed" in pre_sig:
+                pre_args["packed"] = False
+            strategy.step_pre_backward(params, optimizers, strategy_state, step, info, **pre_args)
         loss.backward()
+        visibility = _visible_gaussian_mask(info)
+        radii_ok = visibility is not None
         for opt in optimizers.values():
-            if selective_cls is not None and opt_cls is selective_cls and isinstance(info, dict) and "radii" in info:
-                try:
-                    opt.step(visibility=(info["radii"] > 0).any(dim=0))
-                    continue
-                except TypeError:
-                    pass
-            opt.step()
+            if opt_cls is selective_cls and hasattr(opt, "step") and "visibility" in inspect.signature(opt.step).parameters:
+                if not radii_ok:
+                    raise StageExecutionError("SelectiveAdam requires visibility radii from rasterization info")
+                opt.step(visibility=visibility)
+            else:
+                opt.step()
         if strategy is not None and strategy_state is not None and hasattr(strategy, "step_post_backward"):
             post_kwargs: dict[str, Any] = {}
             if "packed" in post_sig:
@@ -389,7 +427,7 @@ def _optimize_with_gsplat(
             mse = float(((pred - target) ** 2).mean().item())
             last_psnr = float(10.0 * np.log10(1.0 / max(mse, 1e-10)))
             last_ssim = float(ssim_val.item())
-    depths = _render_view_depths(gsplat, torch, params, views, device) if config.export_depths else None
+    depths = _render_view_depths(gsplat, torch, dict(params.items()), views, device) if config.export_depths else None
     with torch.no_grad():
         means, log_scales, quats = params["means"], params["scales"], params["quats"]
         logit_op, colors_p = params["opacities"], params["sh0"]

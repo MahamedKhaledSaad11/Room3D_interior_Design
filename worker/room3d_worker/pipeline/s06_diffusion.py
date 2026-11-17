@@ -789,8 +789,10 @@ def _from_pretrained_with_quant(
     dtype: Any,
     hf_token: str | None,
     quant_kwargs: dict[str, Any],
-) -> Any:
+    quant_mode: str = "fp16_offload",
+) -> tuple[Any, str]:
     kwargs: dict[str, Any] = {"torch_dtype": dtype, "token": hf_token}
+    applied_quant = False
     if quant_kwargs:
         try:
             params = inspect.signature(cls.from_pretrained).parameters
@@ -798,9 +800,17 @@ def _from_pretrained_with_quant(
             for k, v in quant_kwargs.items():
                 if k in params or accepts_var:
                     kwargs[k] = v
+                    applied_quant = True
         except (TypeError, ValueError):
             kwargs.update(quant_kwargs)
-    return cls.from_pretrained(repo_id, **kwargs)
+            applied_quant = True
+    try:
+        return cls.from_pretrained(repo_id, **kwargs), quant_mode
+    except (RuntimeError, ValueError, OSError, ImportError) as exc:
+        if not applied_quant:
+            raise
+        LOGGER.warning("Quantized from_pretrained(%s) failed (%s); retrying fp16_offload", repo_id, exc)
+        return cls.from_pretrained(repo_id, torch_dtype=dtype, token=hf_token), "fp16_offload"
 
 
 def load_diffusion_backend(config: DiffusionConfig | None = None) -> InpaintBackend:
@@ -826,13 +836,26 @@ def load_diffusion_backend(config: DiffusionConfig | None = None) -> InpaintBack
         if sdxl_cls is None:
             raise StageExecutionError("diffusers must provide StableDiffusionXLInpaintPipeline for sdxl_inpaint_t4")
         sdxl_repo = cfg.fallback_model_id if cfg.model_id == DiffusionConfig.model_id else cfg.model_id
-        pipe = _from_pretrained_with_quant(sdxl_cls, sdxl_repo, dtype, hf_token, quant_kwargs)
+        pipe, quant_mode = _from_pretrained_with_quant(sdxl_cls, sdxl_repo, dtype, hf_token, quant_kwargs, quant_mode)
         backend = _DiffusersSdxlBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
     elif flux_cls is not None:
-        pipe = _from_pretrained_with_quant(flux_cls, cfg.model_id, dtype, hf_token, quant_kwargs)
-        backend = _DiffusersFluxKleinBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
+        try:
+            pipe, quant_mode = _from_pretrained_with_quant(
+                flux_cls, cfg.model_id, dtype, hf_token, quant_kwargs, quant_mode
+            )
+            backend = _DiffusersFluxKleinBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
+        except (OSError, ValueError, RuntimeError) as exc:
+            if sdxl_cls is None or cfg.model_id != DiffusionConfig.model_id:
+                raise
+            LOGGER.warning("Failed loading %s (%s); falling back to %s", cfg.model_id, exc, cfg.fallback_model_id)
+            pipe, quant_mode = _from_pretrained_with_quant(
+                sdxl_cls, cfg.fallback_model_id, dtype, hf_token, quant_kwargs, quant_mode
+            )
+            backend = _DiffusersSdxlBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
     elif sdxl_cls is not None:
-        pipe = _from_pretrained_with_quant(sdxl_cls, cfg.fallback_model_id, dtype, hf_token, quant_kwargs)
+        pipe, quant_mode = _from_pretrained_with_quant(
+            sdxl_cls, cfg.fallback_model_id, dtype, hf_token, quant_kwargs, quant_mode
+        )
         backend = _DiffusersSdxlBackend(pipe, torch, cfg, exec_device, quant_mode, dtype_name)
     else:
         raise StageExecutionError("diffusers must provide Flux2KleinInpaintPipeline or StableDiffusionXLInpaintPipeline")

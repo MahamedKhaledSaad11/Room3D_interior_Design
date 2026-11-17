@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from room3d_worker.kaggle.preflight_runner import validate_notebook_syntax
 
 DEFAULT_REPO_URL = "https://github.com/MahamedKhaledSaad11/Room3D_interior_Design.git"
+_NBFORMAT_ID_RE = re.compile(r"^[A-Za-z0-9-_]{1,64}$")
 
 
-def _cell(source: str) -> dict[str, Any]:
+def _cell(source: str, *, cell_id: str = "room3d-cell") -> dict[str, Any]:
     return {
+        "id": cell_id,
         "cell_type": "code",
         "execution_count": None,
         "metadata": {},
@@ -136,13 +139,34 @@ subprocess.run(
     check=True,
 )
 
-# 3. Install sam2, vggt, and gsplat with --no-deps so they never downgrade torch or numpy.
+# 3. Install sam2, vggt, and gsplat with --no-build-isolation --no-deps so they never downgrade torch or numpy.
+sam2_env = os.environ.copy()
+sam2_env["SAM2_BUILD_CUDA"] = "0"
 subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "git+https://github.com/facebookresearch/sam2.git"],
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "--no-build-isolation",
+        "--no-deps",
+        "git+https://github.com/facebookresearch/sam2.git",
+    ],
+    env=sam2_env,
     check=True,
 )
 subprocess.run(
-    [sys.executable, "-m", "pip", "install", "-q", "--no-deps", "git+https://github.com/facebookresearch/vggt.git"],
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "--no-build-isolation",
+        "--no-deps",
+        "git+https://github.com/facebookresearch/vggt.git",
+    ],
     check=False,
 )
 subprocess.run(
@@ -201,6 +225,7 @@ PIPELINE_MODE = "precomputed_colmap"  # "precomputed_colmap" or "full_w7_pipelin
 VIDEO_PATH = str(Path("/kaggle/working/room3d/db/sample_room.mp4"))
 MAX_LONG_SIDE = 960  # -> 960x624 mod-16 for db/playroom & db/drjohnson
 TRAIN_ITERATIONS = 7000
+MAX_EDIT_FRAMES = 16
 REF_FRAME_IDX = 0
 CLICK_POINTS = [{"x": 480, "y": 312, "label": 1}]
 EDIT_PROMPT = "modern emerald velvet armchair"
@@ -479,7 +504,13 @@ if not ckpt_path.exists():
     urllib.request.urlretrieve(SAM2_URL, ckpt_path)
 
 manifest = json.loads((V1_DIR / "manifest.json").read_text(encoding="utf-8"))
-image_paths = {int(f["frame_idx"]): str(V1_DIR / f["image_relpath"]) for f in manifest["frames"] if f.get("cam_from_world")}
+registered_frames = [f for f in manifest["frames"] if f.get("cam_from_world")]
+selected_frames = registered_frames[:MAX_EDIT_FRAMES]
+if all(int(f["frame_idx"]) != REF_FRAME_IDX for f in selected_frames):
+    ref_match = [f for f in registered_frames if int(f["frame_idx"]) == REF_FRAME_IDX]
+    if ref_match:
+        selected_frames = ref_match + selected_frames[: max(0, MAX_EDIT_FRAMES - 1)]
+image_paths = {int(f["frame_idx"]): str(V1_DIR / f["image_relpath"]) for f in selected_frames}
 
 fig, ax = plt.subplots(figsize=(7, 5))
 ax.imshow(Image.open(image_paths[REF_FRAME_IDX]))
@@ -584,7 +615,13 @@ from PIL import Image
 
 manifest = json.loads((V1_DIR / "manifest.json").read_text(encoding="utf-8"))
 track_out = json.loads((TRACK_DIR / "track_out.json").read_text(encoding="utf-8"))
-frame_paths = {int(f["frame_idx"]): str(V1_DIR / f["image_relpath"]) for f in manifest["frames"] if f.get("cam_from_world")}
+registered_frames = [f for f in manifest["frames"] if f.get("cam_from_world")]
+selected_frames = registered_frames[:MAX_EDIT_FRAMES]
+if all(int(f["frame_idx"]) != REF_FRAME_IDX for f in selected_frames):
+    ref_match = [f for f in registered_frames if int(f["frame_idx"]) == REF_FRAME_IDX]
+    if ref_match:
+        selected_frames = ref_match + selected_frames[: max(0, MAX_EDIT_FRAMES - 1)]
+frame_paths = {int(f["frame_idx"]): str(V1_DIR / f["image_relpath"]) for f in selected_frames}
 ref_seed_path = str(DIFF_DIR / "previews" / f"seed_{CHOSEN_SEED}.png")
 
 apply_res = run_stage_subprocess(
@@ -749,6 +786,10 @@ def build_worker_notebook(
         _cell_11_bundle_zip(),
         _cell_12_daemon(cleaned_url, worker_token.strip(), worker_id.strip() or "kaggle-t4x2"),
     ]
+    for idx, cell in enumerate(cells, start=1):
+        cell["id"] = f"room3d-cell-{idx:02d}"
+        if not _NBFORMAT_ID_RE.match(cell["id"]):
+            raise ValueError(f"invalid cell id: {cell['id']}")
     notebook = {
         "nbformat": 4,
         "nbformat_minor": 5,

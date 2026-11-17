@@ -437,7 +437,7 @@ def _run_opt_loop(
     active = tuple(t[roi_idx].detach().clone().requires_grad_(True) for t in tensors)
     frozen = tuple(t[bg_idx].detach() for t in tensors)
     ks = _build_k_matrix(manifest, torch_mod, dev)
-    opt = torch_mod.optim.Adam(list(active), lr=5e-3)
+    opt = torch_mod.optim.Adam([{"params": list(active), "lr": 5e-3, "name": "roi"}])
     steps = request.fine_tune_steps if request.mode == "masked_finetune" else request.from_scratch_steps
     for step in range(steps):
         pose_np, tgt_np, fg_np = views[step % len(views)]
