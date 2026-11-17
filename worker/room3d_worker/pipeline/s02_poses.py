@@ -23,6 +23,7 @@ from room3d_worker.common.coords import (
 )
 from room3d_worker.common.errors import GeometryError, StageExecutionError
 from room3d_worker.common.manifest import SceneManifest
+from room3d_worker.common.subprocess_runner import run_isolated_stage
 
 BackendName = Literal[
     "colmap_global",
@@ -310,6 +311,7 @@ class PyColmapBackend:
         self.mode = mode
 
     def estimate(self, request: PoseRequest) -> BackendOutput:
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
         pycolmap = _module("pycolmap")
         database = request.database_path or request.output_dir / "database.db"
         if database.resolve().parent == request.image_dir.resolve() or request.image_dir.resolve() in database.resolve().parents:
@@ -354,13 +356,14 @@ class PyColmapBackend:
 
         reader_options = PyColmapBackend._configure_options(
             getattr(pycolmap, "ImageReaderOptions", None),
-            {"camera_mode": single_camera_mode},
+            {"camera_mode": single_camera_mode, "camera_model": "PINHOLE",
+             "camera_params": ",".join(str(request.intrinsics[k]) for k in ("fx", "fy", "cx", "cy"))},
             {"camera_mode": single_camera_mode or "SINGLE"},
         )
         extraction_options = PyColmapBackend._configure_options(
             getattr(pycolmap, "FeatureExtractionOptions", None),
-            {"max_num_features": 4096},
-            {"feature_type": extractor, "max_num_features": 4096},
+            {"max_num_features": 4096, "num_threads": 4},
+            {"feature_type": extractor, "max_num_features": 4096, "num_threads": 4},
             nested=("sift", "max_num_features", 4096),
         )
         extract_kwargs: dict[str, Any] = {
@@ -374,8 +377,8 @@ class PyColmapBackend:
         loop_det = bool(request.vocab_tree_path)
         matching_options = PyColmapBackend._configure_options(
             getattr(pycolmap, "FeatureMatchingOptions", None),
-            {},
-            {"matcher_type": matcher},
+            {"num_threads": 4},
+            {"matcher_type": matcher, "num_threads": 4},
         )
         pair_updates: dict[str, Any] = {"overlap": 12, "loop_detection": loop_det}
         if request.vocab_tree_path is not None:
@@ -400,7 +403,7 @@ class PyColmapBackend:
 
     def _global(self, pycolmap: Any, database: Path, request: PoseRequest, sparse: Path, _: Any) -> Any:
         sparse.mkdir(parents=True, exist_ok=True)
-        options = {"vocab_tree_path": str(request.vocab_tree_path) if request.vocab_tree_path else None, "use_faiss": True}
+        options = {"num_threads": 4}
         result = _call_optional(pycolmap.global_mapping, str(database), str(request.image_dir), str(sparse), options=options)
         return self._maybe_undistort(pycolmap, request, sparse, result)
 
@@ -542,6 +545,59 @@ class PyColmapBackend:
             height=new_h,
             intrinsics=calibrated,
         )
+
+
+class ColmapCliBackend(PyColmapBackend):
+    """Use installed Linux COLMAP/GLOMAP tools and normalize through PyCOLMAP."""
+
+    def __init__(self, mode: Literal["global", "incremental"], colmap: str) -> None:
+        super().__init__(mode)
+        self.colmap = colmap
+
+    def _feature_prefix(self, command: str, modern: str, legacy: str) -> str:
+        result = run_isolated_stage([self.colmap, command, "--help"], None, None, 30)
+        return modern if f"--{modern}.num_threads" in result.stdout + result.stderr else legacy
+
+    def _extract(self, pycolmap: Any, database: Path, request: PoseRequest) -> None:
+        extraction = self._feature_prefix("feature_extractor", "FeatureExtraction", "SiftExtraction")
+        run_isolated_stage([
+            self.colmap, "feature_extractor", "--database_path", str(database),
+            "--image_path", str(request.image_dir), "--ImageReader.single_camera", "1",
+            "--ImageReader.camera_model", "PINHOLE", "--ImageReader.camera_params",
+            ",".join(str(request.intrinsics[k]) for k in ("fx", "fy", "cx", "cy")),
+            f"--{extraction}.num_threads", "4", f"--{extraction}.use_gpu", "0",
+            "--SiftExtraction.max_num_features", "4096",
+        ], None, None, 3600)
+        matching = self._feature_prefix("sequential_matcher", "FeatureMatching", "SiftMatching")
+        command = [
+            self.colmap, "sequential_matcher", "--database_path", str(database),
+            f"--{matching}.num_threads", "4", f"--{matching}.use_gpu", "0",
+            "--SequentialMatching.overlap", "12", "--SequentialMatching.loop_detection",
+            "1" if request.vocab_tree_path else "0",
+        ]
+        if request.vocab_tree_path:
+            command.extend(["--SequentialMatching.vocab_tree_path", str(request.vocab_tree_path)])
+        run_isolated_stage(command, None, None, 3600)
+
+    def _map(self, pycolmap: Any, database: Path, request: PoseRequest, sparse: Path) -> Any:
+        sparse.mkdir(parents=True, exist_ok=True)
+        glomap = shutil.which("glomap") if self.mode == "global" else None
+        run_isolated_stage([
+            glomap or self.colmap, "mapper", "--database_path", str(database),
+            "--image_path", str(request.image_dir), "--output_path", str(sparse),
+        ], None, None, 3600)
+        models = [path.parent for path in sparse.glob("*/cameras.bin")]
+        if not models:
+            raise ColmapFailureError(f"Mapper produced no binary reconstruction under {sparse}")
+        reconstructions = {path: pycolmap.Reconstruction(str(path)) for path in models}
+        best = max(reconstructions, key=lambda path: len(reconstructions[path].images))
+        return self._maybe_undistort(pycolmap, request, best, {0: reconstructions[best]})
+
+    def _global(self, pycolmap: Any, database: Path, request: PoseRequest, sparse: Path, _: Any) -> Any:
+        return self._map(pycolmap, database, request, sparse)
+
+    def _incremental(self, pycolmap: Any, database: Path, request: PoseRequest, sparse: Path, _: Any) -> Any:
+        return self._map(pycolmap, database, request, sparse)
 
 
 class VGGTRunner(Protocol):
@@ -1497,9 +1553,10 @@ def prepare_precomputed_colmap_scene(
 
 
 def _default_backends() -> dict[BackendName, PoseBackend]:
+    colmap = shutil.which("colmap")
     return {
-        "colmap_global": PyColmapBackend("global"),
-        "colmap_incremental": PyColmapBackend("incremental"),
+        "colmap_global": ColmapCliBackend("global", colmap) if colmap else PyColmapBackend("global"),
+        "colmap_incremental": ColmapCliBackend("incremental", colmap) if colmap else PyColmapBackend("incremental"),
         "vggt_chunked": VGGTChunkedBackend(_DefaultVGGTRunner()),
         "precomputed_colmap": PrecomputedColmapBackend(),
     }

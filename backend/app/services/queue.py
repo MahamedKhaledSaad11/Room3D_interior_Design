@@ -486,7 +486,7 @@ def fail_task(
         )
         .values(
             status=next_status,
-            message=detail[:1000],
+            message=detail[-3500:],
             retry_count=task.retry_count + 1 if should_retry else task.retry_count,
             worker_id=None if should_retry else task.worker_id,
             active_attempt_id=None,

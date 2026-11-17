@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
 
 from app.config import Settings
@@ -111,6 +111,27 @@ def test_worker_ownership_conflict_rejected(api) -> None:
             complete_task(session, claimed["task_id"], claimed["attempt_id"], {}, worker_id="w2")
         with pytest.raises(ConflictError, match="own"):
             fail_task(session, claimed["task_id"], claimed["attempt_id"], "ERR", "bad", False, worker_id="w2")
+
+
+def test_failure_message_preserves_diagnostic_tail_for_ui(
+    api: tuple[TestClient, sessionmaker[Session], Settings],
+) -> None:
+    client, session_factory, _ = api
+    project = client.post("/api/projects", json={"name": "Failure diagnostics"}).json()
+    client.post(f"/api/projects/{project['id']}/upload",
+                files={"file": ("room.mp4", _video(), "video/mp4")})
+    headers = {"X-Worker-Token": "dev-worker-token"}
+    claimed = client.post("/api/tasks/claim", headers=headers, json={"worker_id": "w1"}).json()
+    diagnostic = "feature_extraction.cc:445 warning\n" + "x" * 5000 + "\nFATAL: allocation failed"
+    response = client.post(f"/api/tasks/{claimed['task_id']}/fail", headers=headers, json={
+        "attempt_id": claimed["attempt_id"], "error_code": "StageExecutionError",
+        "error_message": diagnostic, "retryable": False,
+    })
+    assert response.status_code == 200
+    with session_factory() as session:
+        task = session.get(Task, claimed["task_id"])
+        assert task is not None and task.status == "failed"
+        assert task.message == diagnostic[-3500:]
 
 
 def test_settings_defaults_resolve_to_repo_local_data() -> None:

@@ -46,6 +46,22 @@ Progress uses `POST /api/tasks/{id}/progress`: training/rebuild iterations, trac
 generated seeds, edited frames, and individual artifact uploads. The parent relays GPU stage
 events from a JSONL file while maintaining the task heartbeat.
 
+Pose subprocesses force `QT_QPA_PLATFORM=offscreen`. When a `colmap` executable is installed,
+the worker extracts SIFT features and matches sequential keyframes with four CPU threads each,
+then runs `glomap mapper`, or `colmap mapper` when GLOMAP is absent. It detects the installed
+COLMAP option names (`SiftExtraction`/`SiftMatching` in older releases,
+`FeatureExtraction`/`FeatureMatching` in newer ones). Without the COLMAP executable it uses
+PyCOLMAP with the same thread cap. PyCOLMAP is still needed to read and normalize CLI results.
+See [COLMAP's CLI](https://colmap.github.io/cli.html) and
+[GLOMAP's mapper contract](https://github.com/colmap/glomap#usage).
+
+Failed stages print their command, exit code, and last 3,500 stderr characters in the Kaggle
+cell output. Timeouts retain partial stderr too. The backend retains the last 3,500 characters
+of the failure message for the UI, with the full error stored on the task attempt.
+After pulling an update in Kaggle, stop and rerun Cell 12 so the daemon reloads its modules;
+restart the local backend after updating its failure-message handling. Submit a new task for
+a failed reconstruction. A passing local regression suite does not replace a live T4 run.
+
 Artifacts go through `StorageDriver` and retain their project-scoped keys. Masks and edited
 frames are individual PNGs for direct browser access; `.zip` bundles are also accepted as binary
 storage objects without automatic extraction. The storage upload endpoint does not apply the

@@ -4,6 +4,7 @@ import importlib
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
@@ -72,18 +73,24 @@ def run_isolated_stage(
         env.update(env_extra)
     if cuda_device is not None:
         env["CUDA_VISIBLE_DEVICES"] = _normalize_cuda_device(cuda_device)
+    env["QT_QPA_PLATFORM"] = "offscreen"
     started = time.perf_counter()
     try:
         result = subprocess.run(
             cmd, env=env, check=False, capture_output=True, text=True, timeout=timeout_sec, shell=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise StageExecutionError(f"Stage command failed to execute {cmd!r}: {exc}") from exc
+        stderr = exc.stderr if isinstance(exc, subprocess.TimeoutExpired) else None
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        message = f"Stage command failed to execute {cmd!r}: {exc}; stderr tail={(stderr or '')[-3500:]}"
+        print(message, file=sys.stderr, flush=True)
+        raise StageExecutionError(message) from exc
     elapsed = time.perf_counter() - started
     if result.returncode != 0:
-        raise StageExecutionError(
-            f"Stage command exited {result.returncode}: {cmd!r}; stderr={result.stderr.strip()}"
-        )
+        message = f"Stage command exited {result.returncode}: {cmd!r}; stderr tail={result.stderr[-3500:]}"
+        print(message, file=sys.stderr, flush=True)
+        raise StageExecutionError(message)
     return StageResult(tuple(cmd), result.returncode, elapsed, result.stdout, result.stderr)
 
 

@@ -295,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spec", required=True, help="Path to JSON stage specification file")
     parser.add_argument("--out", required=False, help="Optional path to write JSON stage output")
     args = parser.parse_args(argv)
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
     result = _STAGE_DISPATCH[args.stage](spec)
     rendered = json.dumps(result, indent=2)

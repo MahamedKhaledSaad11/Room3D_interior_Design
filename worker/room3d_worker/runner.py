@@ -264,6 +264,7 @@ class WorkerRunner:
         except StaleAttemptError:
             return True
         except Exception as exc:
+            logging.getLogger(__name__).exception("Task %s failed", task.task_id)
             try:
                 self.client.fail(task, type(exc).__name__, str(exc), retryable=isinstance(exc, (OSError, RetryableWorkerError)))
             except StaleAttemptError:
