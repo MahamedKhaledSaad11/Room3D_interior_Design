@@ -74,6 +74,9 @@ class GaussianState:
     def normalized_quats(self) -> ArrayF32:
         return normalize_quats(self.quats, len(self.points_xyz))
 
+    def quats_or_identity(self) -> ArrayF32:
+        return self.quats if self.quats is not None else self.normalized_quats()
+
 
 def _resolve_frame_file(folder: Path, frame_idx: int, image_relpath: str | None = None) -> Path | None:
     candidates = [
@@ -103,7 +106,7 @@ def _state_to_common(state: GaussianState) -> Any:
     return CommonGaussianState(
         xyz=state.points_xyz.astype(np.float32),
         scales=normalize_scales(state.scales, len(state.points_xyz)),
-        quats=state.normalized_quats(),
+        quats=state.quats_or_identity(),
         opacities=state.opacity.astype(np.float32).reshape(-1),
         sh0=(state.colors.astype(np.float32) / 255.0),
     )
@@ -179,7 +182,7 @@ def load_base_scene(base_dir: Path) -> tuple[SceneManifest, GaussianState]:
 
 
 def save_gaussian_state(output_dir: Path, state: GaussianState) -> None:
-    quats = state.normalized_quats()
+    quats = state.quats_or_identity()
     scales = normalize_scales(state.scales, len(state.points_xyz))
     np.savez_compressed(
         output_dir / "gs_state.npz",
@@ -325,16 +328,23 @@ def compute_masked_l1_loss(
 def assert_frozen_gaussians_unchanged(base: GaussianState, updated: GaussianState, frozen_mask: ArrayBool) -> float:
     if not frozen_mask.any():
         return 0.0
-    drifts = [
-        float(np.max(np.abs(getattr(updated, key)[frozen_mask].astype(np.float64) - getattr(base, key)[frozen_mask].astype(np.float64))))
+    drifts = {
+        key: float(np.max(np.abs(
+            getattr(updated, key)[frozen_mask].astype(np.float64)
+            - getattr(base, key)[frozen_mask].astype(np.float64)
+        )))
         for key in ("points_xyz", "colors", "opacity", "scales")
-    ]
-    drifts.append(
-        float(np.max(np.abs(updated.normalized_quats()[frozen_mask].astype(np.float64) - base.normalized_quats()[frozen_mask].astype(np.float64))))
-    )
-    max_drift = max(drifts, default=0.0)
+    }
+    drifts["quats"] = float(np.max(np.abs(
+        updated.quats_or_identity()[frozen_mask].astype(np.float64)
+        - base.quats_or_identity()[frozen_mask].astype(np.float64)
+    )))
+    changed_field = max(drifts, key=drifts.__getitem__)
+    max_drift = drifts[changed_field]
     if max_drift != 0.0:
-        raise StageExecutionError(f"Masked finetune mutated frozen background Gaussians: drift={max_drift}")
+        raise StageExecutionError(
+            f"Masked finetune mutated frozen background Gaussians: field={changed_field}, drift={max_drift}"
+        )
     return max_drift
 
 
@@ -463,6 +473,19 @@ def _run_opt_loop(
     return roi_idx, bg_idx, active, frozen, torch_mod
 
 
+def _merge_optimized_roi(base: GaussianState, optimized: GaussianState, roi_mask: ArrayBool) -> GaussianState:
+    # Frozen rows must bypass clipping and quaternion normalization, including when checkpoints are saved.
+    merged = GaussianState(
+        points_xyz=base.points_xyz.copy(), colors=base.colors.copy(),
+        opacity=base.opacity.copy(), scales=base.scales.copy(),
+        quats=base.quats_or_identity().copy(), extra=base.extra.copy(),
+    )
+    for name in ("points_xyz", "colors", "opacity", "scales"):
+        getattr(merged, name)[roi_mask] = getattr(optimized, name)
+    merged.quats_or_identity()[roi_mask] = optimized.quats_or_identity()
+    return merged
+
+
 def _default_gpu_rebuild(
     request: RebuildRequest,
     manifest: SceneManifest,
@@ -482,15 +505,16 @@ def _default_gpu_rebuild(
         raise StageExecutionError("installed gsplat does not expose rasterization")
     torch.manual_seed(request.seed)
     views = _load_training_views(request, manifest, set(request.exclude_frames))
-    roi_idx, bg_idx, active, frozen, torch_mod = _run_opt_loop(request, manifest, base_state, views, roi_mask, torch, rasterize)
+    _, _, active, _, torch_mod = _run_opt_loop(request, manifest, base_state, views, roi_mask, torch, rasterize)
     with torch_mod.no_grad():
-        m_f, c_f, o_f, s_f, q_f = _compose_scene_tensors(base_state, roi_idx, bg_idx, active, frozen, torch_mod)
+        m_f, c_f, o_f, s_f, q_f = active
         pts_out = m_f.detach().cpu().numpy().astype(np.float32)
         cols_out = np.rint(c_f.detach().cpu().numpy().clip(0.0, 1.0) * 255.0).astype(np.uint8)
         op_out = o_f.detach().cpu().numpy().clip(0.0, 1.0).astype(np.float32)
         sc_out = s_f.detach().cpu().numpy().clip(min=1e-5).astype(np.float32)
         q_out = normalize_quats(q_f.detach().cpu().numpy(), len(pts_out))
-    return GaussianState(points_xyz=pts_out, colors=cols_out, opacity=op_out, scales=sc_out, quats=q_out)
+    optimized = GaussianState(points_xyz=pts_out, colors=cols_out, opacity=op_out, scales=sc_out, quats=q_out)
+    return _merge_optimized_roi(base_state, optimized, roi_mask)
 
 
 def _apply_frame_exclusions(frames: list[FrameRecord], skip_frames: set[int]) -> list[dict[str, Any]]:
