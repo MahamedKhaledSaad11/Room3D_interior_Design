@@ -45,7 +45,8 @@ def test_isolated_stage_relays_real_progress_to_parent(tmp_path: Path) -> None:
     with progress_sink(events.append):
         with relay_subprocess_progress(tmp_path / "stage.jsonl") as environment:
             run_stage_on_gpu([sys.executable, "-c", script], None, environment, 15)
-    assert [event.percent for event in events] == [25, 100]
+    assert events and events[-1].percent == 100
+    assert [event.percent for event in events] == sorted(event.percent for event in events)
     assert events[-1].telemetry == {"iteration": 4}
 
 
@@ -61,3 +62,14 @@ def test_tunnel_progress_interruption_retries_without_restarting_task() -> None:
     with WorkerClient("https://backend.test", "secret", transport=httpx.MockTransport(transient), retry_delay=0) as client:
         assert client.progress(task, "07_rebuild", 50, "step 2500")["ok"]
     assert calls == 2
+
+
+def test_progress_relay_coalesces_backlog_and_delivers_final_event(tmp_path: Path) -> None:
+    events: list[ProgressEvent] = []
+    path = tmp_path / "burst.jsonl"
+    with progress_sink(events.append), relay_subprocess_progress(path):
+        with path.open("a", encoding="utf-8") as stream:
+            for percent in range(1, 101):
+                stream.write(ProgressEvent(stage="07_rebuild", percent=percent, message=f"step {percent}").model_dump_json() + "\n")
+    assert events[-1].percent == 100
+    assert len(events) <= 3

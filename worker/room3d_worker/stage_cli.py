@@ -273,6 +273,8 @@ def run_rebuild_stage(spec: dict[str, Any]) -> dict[str, Any]:
         mode=spec.get("mode", "masked_finetune"),
         exclude_frames=tuple(int(i) for i in spec.get("exclude_frames", [])),
         device=str(spec.get("device", "cuda:0")),
+        rebuild_safeguards=bool(spec.get("rebuild_safeguards", False)),
+        unmasked_weight=float(spec.get("unmasked_weight", 1.0)),
     )
     return rebuild_scene(req)
 

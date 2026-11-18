@@ -44,11 +44,11 @@ def manifest() -> SceneManifest:
     })
 
 
-@pytest.mark.parametrize("mode", ["masked_finetune", "from_scratch"])
+@pytest.mark.parametrize(("mode", "safeguards"), [("masked_finetune", False), ("masked_finetune", True), ("from_scratch", False)])
 @pytest.mark.parametrize("scale", [1e-7, 0.02])
 def test_optimizer_preserves_frozen_values_through_checkpoint_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: rebuild.GaussianState,
-    manifest: SceneManifest, mode: rebuild.RebuildMode, scale: float,
+    manifest: SceneManifest, mode: rebuild.RebuildMode, scale: float, safeguards: bool,
 ) -> None:
     pytest.importorskip("torch")
     state.scales[:] = scale
@@ -67,6 +67,7 @@ def test_optimizer_preserves_frozen_values_through_checkpoint_save(
         base_dir=tmp_path, edited_frames_dir=tmp_path, masks_dir=tmp_path, output_dir=tmp_path,
         project_id="room", version_id="v2", parent_version_id="v1", mode=mode,
         device="cpu", fine_tune_steps=3, from_scratch_steps=3,
+        rebuild_safeguards=safeguards,
     )
     updated = rebuild._default_gpu_rebuild(request, manifest, state, roi)
     assert rebuild.assert_frozen_gaussians_unchanged(state, updated, ~roi) == 0.0
@@ -97,3 +98,43 @@ def test_frozen_guard_rejects_actual_changes(state: rebuild.GaussianState, name:
     frozen = np.ones(len(state.points_xyz), dtype=bool)
     with pytest.raises(StageExecutionError, match="mutated frozen background Gaussians"):
         rebuild.assert_frozen_gaussians_unchanged(state, updated, frozen)
+
+
+def test_near_camera_pruning_preserves_frozen_and_visible_opaque_splats(
+    tmp_path: Path, manifest: SceneManifest,
+) -> None:
+    points = np.array([[0, 0, .2], [0, 0, .2], [0, 0, 2], [1, 0, .2], [0, 0, -.2], [0, 0, .2]], np.float32)
+    state = rebuild.GaussianState(points, np.full((6, 3), 128, np.uint8),
+                                  np.array([.01, .01, .01, .01, .01, .9], np.float32),
+                                  np.full((6, 3), .01, np.float32), normalize_quats(None, 6))
+    request = rebuild.RebuildRequest(tmp_path, tmp_path, tmp_path, tmp_path, "room", "v2", "v1",
+                                      rebuild_safeguards=True, device="cpu")
+    updated, count = rebuild.prune_near_camera_floaters(state, manifest, np.array([True, False, True, True, True, True]), request)
+    assert count == 1
+    np.testing.assert_array_equal(updated.points_xyz, state.points_xyz[1:])
+    np.testing.assert_array_equal(updated.opacity, state.opacity[1:])
+
+
+def test_safeguard_bounds_use_foreground_depth_and_keep_weight_at_least_one(
+    tmp_path: Path, manifest: SceneManifest, state: rebuild.GaussianState,
+) -> None:
+    from PIL import Image
+
+    masks = tmp_path / "masks"
+    depths = tmp_path / "depths"
+    masks.mkdir()
+    depths.mkdir()
+    mask = np.zeros((64, 64), np.uint8)
+    mask[28:36, 28:36] = 255
+    Image.fromarray(mask).save(masks / "000000.png")
+    np.save(depths / "000000.npy", np.ones((64, 64), np.float32))
+    request = rebuild.RebuildRequest(tmp_path, tmp_path, masks, tmp_path, "room", "v2", "v1", device="cpu")
+    assert request.rebuild_safeguards is False
+    assert (request.fine_tune_steps, request.from_scratch_steps) == (5000, 15000)
+    lower, upper = rebuild.foreground_bounds(request, manifest, state, np.ones(128, bool))
+    assert np.max(np.abs(lower[:2])) < .1 and np.max(np.abs(upper[:2])) < .1
+    assert lower[2] < 1 < upper[2]
+    with pytest.raises(ValueError, match="unmasked_weight"):
+        replace(request, unmasked_weight=.5)
+    with pytest.raises(ValueError, match="masked_finetune"):
+        replace(request, rebuild_safeguards=True, mode="from_scratch")

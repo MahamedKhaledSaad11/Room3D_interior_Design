@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
 
+@dataclass(frozen=True)
+class StorageObject:
+    key: str
+    size: int
+    etag: str
+
+
 class StorageDriver(ABC):
+    @abstractmethod
+    def list_objects(self, prefix: str) -> list[StorageObject]: ...
+
     @abstractmethod
     def put_stream(self, key: str, stream: BinaryIO, chunk_size: int = 1024 * 1024) -> int: ...
 

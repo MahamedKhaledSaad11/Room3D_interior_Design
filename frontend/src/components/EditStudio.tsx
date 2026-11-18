@@ -144,6 +144,7 @@ export default function EditStudio({
   const [rebuildMode, setRebuildMode] = useState<RebuildMode>("masked_finetune");
   const [busy, setBusy] = useState(false);
   const [maskRevision, setMaskRevision] = useState(0);
+  const framesRevisionRef = useRef("");
   const [statusMessage, setStatusMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -183,7 +184,6 @@ export default function EditStudio({
   const loadFrames = useCallback(async (targetEditId: string, page = 1) => {
     const data = await roomApi.editFrames(targetEditId, page);
     setFramesData(data);
-    setMaskRevision((r) => r + 1);
   }, []);
 
   const notifyTasks = useCallback(() => {
@@ -242,12 +242,15 @@ export default function EditStudio({
   useEffect(() => {
     if (!editId || !pollingEdit) return;
     let cancelled = false;
+    let refreshing = false;
     const pollOnce = async () => {
+      if (refreshing || cancelled) return;
+      refreshing = true;
       try {
         const latest = await roomApi.getEdit(projectId, editId);
         if (cancelled || !latest) return;
         setEditSession(latest);
-        setMaskRevision((r) => r + 1);
+        setMaskRevision(latest.mask_revision ?? 0);
         const previewMap = latest.preview_seeds ?? {};
         const seeds = Object.keys(previewMap);
         if (latest.status === "preview_ready" || (seeds.length > 0 && latest.status !== "previewing")) {
@@ -260,7 +263,11 @@ export default function EditStudio({
           const matched = resolveSeedKey(previewMap, chosenSeed);
           setChosenSeed(matched ?? seeds[0]!);
         }
-        await loadFrames(editId, framesData?.page ?? 1);
+        const frameRevision = `${editId}:${framesData?.page ?? 1}:${latest.mask_revision ?? latest.status ?? "legacy"}`;
+        if (framesRevisionRef.current !== frameRevision) {
+          await loadFrames(editId, framesData?.page ?? 1);
+          framesRevisionRef.current = frameRevision;
+        }
         if (latest.status && !ACTIVE_EDIT_STATUSES.has(latest.status)) {
           setPollingEdit(false);
           if (latest.status === "completed") {
@@ -273,6 +280,8 @@ export default function EditStudio({
         }
       } catch (reason) {
         if (!cancelled) setError(reason instanceof Error ? reason.message : "Unable to refresh edit progress.");
+      } finally {
+        refreshing = false;
       }
     };
     void pollOnce();
@@ -344,7 +353,10 @@ export default function EditStudio({
     setEditSession((prev) => (prev ? { ...prev, preview_seeds: {} } : prev));
     await loadFrames(targetEditId, framesData?.page ?? 1);
     const latest = await roomApi.getEdit(projectId, targetEditId);
-    if (latest) setEditSession(latest);
+    if (latest) {
+      setEditSession(latest);
+      setMaskRevision(latest.mask_revision ?? 0);
+    }
   };
 
   const handleToggleSkip = async (frameIdx: number, skip: boolean) => {

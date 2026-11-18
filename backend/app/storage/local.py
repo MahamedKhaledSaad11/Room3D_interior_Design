@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
-from .base import StorageDriver, validate_key
+from .base import StorageDriver, StorageObject, validate_key
 
 
 class LocalStorage(StorageDriver):
@@ -19,6 +19,18 @@ class LocalStorage(StorageDriver):
         if candidate != self.root and self.root not in candidate.parents:
             raise ValueError("storage path escapes storage root")
         return candidate
+
+    def list_objects(self, prefix: str) -> list[StorageObject]:
+        target = self.safe_resolve(prefix)
+        paths = [target] if target.is_file() else target.rglob("*")
+        result: list[StorageObject] = []
+        for path in paths:
+            if path.is_file() and not path.is_symlink():
+                key = path.relative_to(self.root).as_posix()
+                self.safe_resolve(key)
+                stat = path.stat()
+                result.append(StorageObject(key, stat.st_size, f"{stat.st_mtime_ns:x}-{stat.st_size:x}"))
+        return sorted(result, key=lambda item: item.key)
 
     def put_stream(self, key: str, stream: BinaryIO, chunk_size: int = 1024 * 1024) -> int:
         target = self.safe_resolve(key)

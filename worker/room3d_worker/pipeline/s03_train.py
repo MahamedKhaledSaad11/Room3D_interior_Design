@@ -190,7 +190,7 @@ def save_depth_maps(depth_maps: Any, output_dir: str | Path) -> list[Path]:
         raise GeometryError("depth_maps must be finite arrays shaped (N, H, W)")
     paths: list[Path] = []
     for index, depth in enumerate(array):
-        path = target / f"{index:05d}.npy"
+        path = target / f"{index:06d}.npy"
         np.save(path, depth.astype(np.float32), allow_pickle=False)
         paths.append(path)
     return paths
@@ -538,7 +538,7 @@ def train_scene(
         depths_dir = config.output_dir / "depths"
         depths_dir.mkdir(parents=True, exist_ok=True)
         for frame_idx, depth in rendered_depths.items():
-            np.save(depths_dir / f"{frame_idx:05d}.npy", depth.astype(np.float32), allow_pickle=False)
+            np.save(depths_dir / f"{frame_idx:06d}.npy", depth.astype(np.float32), allow_pickle=False)
     elif config.export_depths:
         (config.output_dir / "depths").mkdir(parents=True, exist_ok=True)
     telemetry = TrainTelemetry(psnr, ssim, int(len(refined.xyz)), _peak_vram_mb(torch), time.perf_counter() - started)

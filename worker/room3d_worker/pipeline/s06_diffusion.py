@@ -553,8 +553,8 @@ def _propagate_sequential(
             comp = orig
             frame_records[idx] = {"frame_idx": idx, "skipped": True, "method": "unchanged_original", "mask_coverage": 0.0}
         max_diff = max(max_diff, _save_edited_frame(edited_dir, idx, comp, orig, mask))
-        report_progress("06_diffusion", 100 * len(frame_records) / max(len(frame_paths), 1),
-                        f"Edited frame {len(frame_records)}/{len(frame_paths)}", frame_idx=idx)
+        report_progress("06_diffusion", 10 + 85 * len(frame_records) / max(len(frame_paths), 1),
+                        f"Editing frame {len(frame_records)}/{len(frame_paths)}", frame_idx=idx)
     return edited_count, max_diff
 
 
@@ -686,6 +686,8 @@ def propagate_masked_edits(
             )
             inpainted_count += c
             max_diff = max(max_diff, d)
+            report_progress("06_diffusion", 10 + 85 * len(frame_records) / max(len(frame_paths), 1),
+                            f"Editing frame {len(frame_records)}/{len(frame_paths)}")
     else:
         inpainted_count, d = _propagate_sequential(
             inpaint_indices,
@@ -704,6 +706,7 @@ def propagate_masked_edits(
         max_diff = max(max_diff, d)
 
     edited_count += inpainted_count
+    report_progress("06_diffusion", 95, f"Edited {len(frame_records)}/{len(frame_paths)} frames")
     skipped_count = sum(1 for rec in frame_records.values() if rec["skipped"])
     elapsed = max(time.perf_counter() - t0, 1e-6)
     sec_per_frame = round(elapsed / max(edited_count, len(frame_paths), 1), 4)

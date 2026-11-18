@@ -277,7 +277,7 @@ def update_progress(
 ) -> float:
     task = _locked_task(session, task_id)
     _check_active_attempt(session, task, attempt_id, worker_id=worker_id)
-    progress = compute_progress(task.task_type, stage, progress_pct)
+    progress = max(task.progress_pct, compute_progress(task.task_type, stage, progress_pct))
     task.current_stage, task.progress_pct, task.message, task.status = stage, progress, message, "running"
     if telemetry:
         task.payload_json = json.dumps({**json.loads(task.payload_json or "{}"), "telemetry": telemetry})

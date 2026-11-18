@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import get_settings
 from .db import Base, engine
-from .routers import artifact_uploads, auth, edits, projects, scenes, tasks
+from .routers import artifact_uploads, auth, bundles, edits, projects, scenes, tasks
 from .services.queue import ConflictError
 
 LOGGER = logging.getLogger(__name__)
@@ -52,6 +52,7 @@ async def error_handler(_: Request, exc: Exception) -> JSONResponse:
 
 app.include_router(auth.router)
 app.include_router(projects.router)
+app.include_router(bundles.router)
 app.include_router(scenes.router)
 app.include_router(artifact_uploads.router)
 app.include_router(tasks.router)

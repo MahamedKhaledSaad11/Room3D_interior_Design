@@ -19,8 +19,18 @@ from scipy.spatial import cKDTree
 from room3d_worker.common.errors import GeometryError, StageExecutionError
 from room3d_worker.common.manifest import FrameRecord, SceneManifest, load_manifest
 from room3d_worker.common.progress import report_progress
-from room3d_worker.pipeline.s04_export import ExportRequest, export_scene, normalize_quats, normalize_scales, read_ply_splats
-from room3d_worker.pipeline.s05_track import load_binary_mask_png
+from room3d_worker.pipeline.s04_export import (
+    ExportRequest,
+    export_scene,
+    normalize_quats,
+    normalize_scales,
+    read_ply_splats,
+)
+from room3d_worker.pipeline.s05_track import (
+    _lift_foreground_points,
+    _load_depth_map,
+    load_binary_mask_png,
+)
 
 ArrayF32 = NDArray[np.float32]
 ArrayBool = NDArray[np.bool_]
@@ -47,12 +57,19 @@ class RebuildRequest:
     device: str = "cuda:1"
     seed: int = 0
     test_every: int = 0
+    rebuild_safeguards: bool = False
+    unmasked_weight: float = 1.0
+    near_plane_distance: float = 0.35
+    floater_opacity_threshold: float = 0.05
+    bbox_pad_fraction: float = 0.1
 
     def __post_init__(self) -> None:
         if self.device not in {"cuda:0", "cuda:1", "cpu"}:
             raise ValueError("Week 2 3DGS rebuild device must be cuda:1, cuda:0, or cpu")
         if self.mode not in {"masked_finetune", "from_scratch"}:
             raise ValueError(f"Unsupported rebuild mode: {self.mode}")
+        if self.rebuild_safeguards and self.mode != "masked_finetune":
+            raise ValueError("Background-preserving safeguards require masked_finetune mode")
         if (
             self.fine_tune_steps <= 0
             or self.from_scratch_steps <= 0
@@ -61,6 +78,10 @@ class RebuildRequest:
             or self.masked_loss_weight <= 0.0
         ):
             raise ValueError("Invalid optimization step, loss weight, or ROI padding configuration")
+        if (not np.isfinite([self.unmasked_weight, self.near_plane_distance, self.floater_opacity_threshold, self.bbox_pad_fraction]).all()
+                or self.unmasked_weight < 1 or self.near_plane_distance <= 0
+                or not 0 <= self.floater_opacity_threshold <= 1 or self.bbox_pad_fraction < 0):
+            raise ValueError("Rebuild safeguards require unmasked_weight >= 1 and valid near-plane/opacity bounds")
 
 
 @dataclass(frozen=True)
@@ -326,6 +347,54 @@ def compute_masked_l1_loss(
     return fg_loss + unmasked_weight * float(np.abs(rendered[~fg] - target[~fg]).mean())
 
 
+def foreground_bounds(
+    request: RebuildRequest, manifest: SceneManifest, state: GaussianState, roi_mask: ArrayBool,
+) -> tuple[ArrayF32, ArrayF32]:
+    samples: list[NDArray[np.float64]] = []
+    for frame in manifest.frames:
+        mask_path = _resolve_frame_file(request.masks_dir, frame.frame_idx)
+        if frame.excluded or frame.frame_idx in request.exclude_frames or frame.cam_from_world is None or mask_path is None:
+            continue
+        depth = _load_depth_map(request.base_dir / "depths", frame.frame_idx)
+        if depth is not None and depth.shape != (manifest.height, manifest.width):
+            raise GeometryError(f"Depth dimensions do not match manifest for frame {frame.frame_idx}")
+        mask = load_binary_mask_png(mask_path, (manifest.height, manifest.width))
+        points = _lift_foreground_points(mask, np.asarray(frame.cam_from_world), manifest.intrinsics.model_dump(), depth)
+        if len(points):
+            samples.append(points)
+    points = np.concatenate(samples) if samples else state.points_xyz[roi_mask].astype(np.float64)
+    if len(points) == 0:
+        raise StageExecutionError("Cannot bound edited foreground: masks contain no supported 3D points")
+    lower, upper = np.percentile(points, [1, 99], axis=0)
+    padding = np.maximum(upper - lower, 1e-4) * request.bbox_pad_fraction
+    return (lower - padding).astype(np.float32), (upper + padding).astype(np.float32)
+
+
+def prune_near_camera_floaters(
+    state: GaussianState, manifest: SceneManifest, roi_mask: ArrayBool, request: RebuildRequest,
+) -> tuple[GaussianState, int]:
+    remove = np.zeros(len(state.points_xyz), dtype=bool)
+    candidates = roi_mask & (state.opacity < request.floater_opacity_threshold)
+    points = state.points_xyz[candidates]
+    intr = manifest.intrinsics
+    for frame in manifest.frames:
+        if frame.excluded or frame.frame_idx in request.exclude_frames or frame.cam_from_world is None:
+            continue
+        pose = np.asarray(frame.cam_from_world)
+        camera = points @ pose[:3, :3].T + pose[:3, 3]
+        z = camera[:, 2]
+        positive = z > 0
+        u = intr.fx * camera[:, 0] / np.maximum(z, 1e-8) + intr.cx
+        v = intr.fy * camera[:, 1] / np.maximum(z, 1e-8) + intr.cy
+        visible = positive & (z < request.near_plane_distance) & (u >= 0) & (u < manifest.width) & (v >= 0) & (v < manifest.height)
+        remove[np.flatnonzero(candidates)[visible]] = True
+    keep = ~remove
+    if not keep.any():
+        raise StageExecutionError("Near-camera pruning would remove the entire scene")
+    return GaussianState(state.points_xyz[keep], state.colors[keep], state.opacity[keep],
+                         state.scales[keep], state.quats_or_identity()[keep], state.extra), int(remove.sum())
+
+
 def assert_frozen_gaussians_unchanged(base: GaussianState, updated: GaussianState, frozen_mask: ArrayBool) -> float:
     if not frozen_mask.any():
         return 0.0
@@ -450,6 +519,8 @@ def _run_opt_loop(
     ks = _build_k_matrix(manifest, torch_mod, dev)
     opt = torch_mod.optim.Adam([{"params": list(active), "lr": 5e-3, "name": "roi"}])
     steps = request.fine_tune_steps if request.mode == "masked_finetune" else request.from_scratch_steps
+    bounds = foreground_bounds(request, manifest, base_state, roi_mask) if request.rebuild_safeguards and request.mode == "masked_finetune" else None
+    limits = tuple(torch_mod.as_tensor(value, device=dev) for value in bounds) if bounds is not None else None
     for step in range(steps):
         pose_np, tgt_np, fg_np = views[step % len(views)]
         opt.zero_grad()
@@ -466,14 +537,19 @@ def _run_opt_loop(
             bg_mask = ~fg_mask
             fg_loss = (pred[fg_mask] - target[fg_mask]).abs().mean()
             bg_loss = (pred[bg_mask] - target[bg_mask]).abs().mean() if bg_mask.any() else 0.0
+            if request.rebuild_safeguards:
+                bg_loss = request.unmasked_weight * bg_loss
             loss = request.masked_loss_weight * fg_loss + bg_loss
         else:
             loss = (pred - target).abs().mean()
         loss.backward()
         opt.step()
+        if limits is not None:
+            with torch_mod.no_grad():
+                active[0].clamp_(min=limits[0], max=limits[1])
         if (step + 1) % 50 == 0 or step == steps - 1:
-            report_progress("07_rebuild", 100 * (step + 1) / steps,
-                            f"Rebuild iteration {step + 1}/{steps}", iteration=step + 1)
+            report_progress("07_rebuild", 10 + 85 * (step + 1) / steps,
+                            f"Rebuilding 3DGS step {step + 1}/{steps}", iteration=step + 1)
     return roi_idx, bg_idx, active, frozen, torch_mod
 
 
@@ -693,6 +769,7 @@ def rebuild_scene(
 ) -> dict[str, Any]:
     """Execute Week 2 localized 3DGS fine-tune or from-scratch ablation without touching COLMAP poses."""
     started = time.perf_counter()
+    report_progress("07_rebuild", 10, "Loading base scene and foreground masks")
     base_manifest, base_state = load_base_scene(request.base_dir)
     _validate_rebuild_preconditions(request, base_manifest)
     skip_set = set(request.exclude_frames)
@@ -701,12 +778,20 @@ def rebuild_scene(
             base_state.points_xyz, base_manifest, request.masks_dir, skip_set, request.roi_pad_px, request.min_mask_hits
         )
         init_state = base_state
+        if request.rebuild_safeguards:
+            lower, upper = foreground_bounds(request, base_manifest, base_state, roi_mask)
+            roi_mask &= ((base_state.points_xyz >= lower) & (base_state.points_xyz <= upper)).all(axis=1)
+            if not roi_mask.any():
+                raise StageExecutionError("No editable Gaussians lie inside the foreground bounds; check mask/depth alignment")
     else:
         sparse_init = _init_from_sparse_dir(request.base_dir / "sparse" / "0")
         init_state = sparse_init if sparse_init is not None else base_state
         roi_mask = np.ones(len(init_state.points_xyz), dtype=bool)
     updated = (backend or _default_gpu_rebuild)(request, base_manifest, init_state, roi_mask)
     max_unmasked_drift = assert_frozen_gaussians_unchanged(base_state, updated, ~roi_mask) if request.mode == "masked_finetune" else 0.0
+    pruned = 0
+    if request.rebuild_safeguards:
+        updated, pruned = prune_near_camera_floaters(updated, base_manifest, roi_mask, request)
     rebuilt_manifest = _export_rebuilt_scene(request, base_manifest, updated, skip_set)
     max_pose_drift = _verify_pose_invariance(base_manifest, rebuilt_manifest)
     steps = request.fine_tune_steps if request.mode == "masked_finetune" else request.from_scratch_steps
@@ -717,6 +802,7 @@ def rebuild_scene(
         "excluded_frame_count": int(sum(1 for f in rebuilt_manifest.frames if f.excluded)),
         "max_pose_drift": max_pose_drift, "max_unmasked_gaussian_drift": max_unmasked_drift,
         "parent_version_id": request.parent_version_id, "version_id": request.version_id,
+        "rebuild_safeguards": request.rebuild_safeguards, "near_camera_floaters_pruned": pruned,
     }
     (request.output_dir / "rebuild_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     return metrics

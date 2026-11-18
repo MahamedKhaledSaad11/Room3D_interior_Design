@@ -23,27 +23,30 @@ export interface ProgressPanelProps {
   message?: string | null;
   telemetry?: Telemetry | null;
   onRetry?: () => void;
+  taskType?: string;
 }
 
 const formatRuntime = (seconds?: number): string =>
   seconds === undefined ? "—" : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
 
-export function ProgressPanel({ progress, stage, status, message, telemetry, onRetry }: ProgressPanelProps) {
+export function ProgressPanel({ progress, stage, status, message, telemetry, onRetry, taskType }: ProgressPanelProps) {
   const failed = status === "failed";
   const done = status === "completed";
   const isWeek2 = stage?.startsWith("05_") || stage?.startsWith("06_") || stage?.startsWith("07_");
-  const activeStages = isWeek2 ? WEEK2_STAGES : WEEK1_STAGES;
+  const ownStage = isWeek2 && taskType ? WEEK2_STAGES.find((item) => item.id === stage) : undefined;
+  const activeStages = ownStage ? [{ ...ownStage, threshold: 100 }] : isWeek2 ? WEEK2_STAGES : WEEK1_STAGES;
+  const heading = ownStage?.id === "06_diffusion" ? "Editing your object" : ownStage?.id === "07_rebuild" ? "Rebuilding edited scene" : "Building your room";
 
   return (
     <section className="progress-panel" aria-label="Scene processing progress">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">{isWeek2 ? "OBJECT EDIT" : "ROOM BUILD"}</p>
-          <h2>{failed ? "Build needs attention" : done ? "Room ready" : "Building your room"}</h2>
+          <h2>{failed ? "Build needs attention" : done ? "Room ready" : heading}</h2>
         </div>
         <strong>{Math.round(progress)}%</strong>
       </div>
-      <div className="progress-track">
+      <div className="progress-track" role="progressbar" aria-label="Task progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)}>
         <span style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} />
       </div>
       <div className="stage-list">

@@ -80,6 +80,55 @@ the stored mask overlays. Use **Mark Object**, **Skip/Include Frame**, or **Uplo
 correct tracking. Generate four seed previews, select one, then apply the edit. Completion loads
 the rebuilt version in `Viewer3D` (the repository's splat viewer) and exposes **Before / After**.
 
+Asset transport now uses these routes (repeat `?paths=images&paths=depths` to select components):
+
+- `GET /api/storage/{project_id}/{version_id}/bundle-index` and `bundle.zip`.
+- `GET /api/storage/{project_id}/edits/{edit_id}/bundle-index` and `bundle.zip`.
+- `POST /api/storage/{project_id}/{version_id}/upload-bundle` and
+  `POST /api/storage/{project_id}/edits/{edit_id}/upload-bundle`, with a ZIP `file` form field.
+
+The archive uses lossless DEFLATE level 1; images, masks, float32 depths, and checkpoints are
+copied as bytes without decoding or re-encoding. Responses stream from temporary disk files,
+keeping memory bounded. Uploads validate names, links, expanded size, and CRCs before publishing.
+Existing single-file endpoints remain available. ZIPs above the worker's 8 MiB threshold use the
+existing chunk/size/SHA-256 contract and are unpacked at commit; acknowledgement retries are safe.
+
+On Linux the daemon caches assets in `/tmp/room3d_cache/{project_id}/{version_id}` and
+`/tmp/room3d_cache/{project_id}/edits/{edit_id}`. `ROOM3D_CACHE_ROOT` overrides the cache root
+(Windows defaults to its system temporary directory). Each stage checks one asset inventory,
+downloads only components with changed revisions, and copies cached bytes into its own work
+directory. Mutable masks are revalidated; conditional ZIP downloads reject a revision race and
+refresh the inventory. LRU eviction bounds the cache at 3,000,000,000 bytes, protects active
+scene transfers, and bypasses caching when an asset set cannot fit. ZIP staging uses task work
+directories, so it does not add unbounded temporary archives to the cache partition. Run one
+daemon per cache root. Stage work directories have their own storage lifetime.
+
+New frame/depth/mask outputs use six-digit indices. Legacy five-digit depths and edit PNGs are
+mapped to six digits inside the inventory/archive without HTTP fallback probes; original stored
+files and older single-file URLs remain available. If both names exist, the canonical six-digit
+asset takes precedence. The lossless transport changes do not alter optimizer iterations,
+diffusion settings, image pixels, or checkpoint parameters.
+
+Diffusion and rebuild report live 10–95% processing progress, then 95–99% bundle transfer progress;
+completion reaches 100%. The subprocess relay coalesces queued events rather than replaying a
+long HTTP backlog after GPU work finishes. Edit Studio uses task percentages and stable mask
+revision URLs, and review thumbnails load lazily.
+
+Rebuild safeguards are **off by default** to preserve the existing visual behavior. To opt in,
+send `rebuild_safeguards: true` and optionally `unmasked_weight: 1.0` (minimum 1.0) to
+`POST /api/edits/{edit_id}/apply`, or include those fields in a rebuild stage spec. They require
+`masked_finetune`: foreground depth samples define a padded 3D box, only the existing mask ROI
+inside it is optimized, and positions are constrained to that box. Background parameters stay
+bitwise frozen. After optimization, editable splats with opacity below 0.05 and visible positive
+camera depth below 0.35 are pruned. This distance uses reconstruction units, **not guaranteed
+meters**. These optional safeguards intentionally change the reconstruction and do not promise
+to eliminate all fog artifacts or repair a poorly calibrated base scene.
+
+The local 900-asset transport regression uses four HTTP requests: one upload, one inventory and
+ZIP download for the first stage, and one inventory-only check for a second stage. This is a
+request-count result, not a measured Kaggle/Cloudflare wall-time speedup. After pulling updates,
+restart the backend and the Kaggle Cell 12 daemon to load the new endpoints and cache behavior.
+
 Local verification:
 
 ```powershell

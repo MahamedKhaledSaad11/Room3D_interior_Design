@@ -213,7 +213,7 @@ def filter_neighbor_iou(
 def _load_depth_map(depth_dir: Path | None, frame_idx: int) -> FloatArray | None:
     if depth_dir is None:
         return None
-    for name in (f"{frame_idx:05d}.npy", f"{frame_idx:06d}.npy", f"depth_{frame_idx:05d}.npy"):
+    for name in (f"{frame_idx:06d}.npy", f"{frame_idx:05d}.npy", f"depth_{frame_idx:05d}.npy"):
         npy_path = depth_dir / name
         if npy_path.exists():
             return np.load(npy_path, allow_pickle=False).astype(np.float32)

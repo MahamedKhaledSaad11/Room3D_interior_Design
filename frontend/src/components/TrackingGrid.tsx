@@ -95,6 +95,8 @@ export default function TrackingGrid({
                 {thumbSrc ? (
                   <img
                     src={thumbSrc}
+                    loading="lazy"
+                    decoding="async"
                     alt={`Frame ${item.frame_idx}`}
                     style={{ width: "100%", height: "64px", objectFit: "cover", borderRadius: "4px" }}
                   />
@@ -102,6 +104,8 @@ export default function TrackingGrid({
                 {item.mask_key && !item.skip_frame ? (
                   <img
                     src={cacheBustUrl(storageKeyUrl(item.mask_key), cacheKey)}
+                    loading="lazy"
+                    decoding="async"
                     alt={`Mask for frame ${item.frame_idx}`}
                     data-testid={`mask-thumb-${item.frame_idx}`}
                     style={{

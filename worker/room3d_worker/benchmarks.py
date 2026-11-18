@@ -71,7 +71,7 @@ def _write_synthetic_frames(image_dir: Path, num_frames: int, hw: tuple[int, int
         cx = int(w * 0.35 + (idx / max(num_frames - 1, 1)) * w * 0.3)
         cy = h // 2
         arr[max(0, cy - 16) : min(h, cy + 16), max(0, cx - 16) : min(w, cx + 16)] = (210, 75, 45)
-        path = image_dir / f"{idx:05d}.png"
+        path = image_dir / f"{idx:06d}.png"
         Image.fromarray(arr).save(path, format="PNG")
         paths[idx] = path
     return paths
@@ -180,7 +180,7 @@ def _benchmark_tracking(root: Path, num_frames: int, hw: tuple[int, int]) -> dic
             "frame_idx": idx,
             "orig_video_frame": idx,
             "timestamp_sec": float(idx) * 0.5,
-            "image_relpath": f"images/{idx:05d}.png",
+            "image_relpath": f"images/{idx:06d}.png",
             "colmap_image_id": idx + 1,
             "cam_from_world": np.eye(4).tolist(),
         })

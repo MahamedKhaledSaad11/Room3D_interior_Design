@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import shutil
+import stat
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterator
+from typing import Any, BinaryIO, Callable, Iterator, cast
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import httpx
 
+from room3d_worker.common.assets import (
+    AssetInfo,
+    AssetRevisionError,
+    asset_revision,
+    safe_asset_path,
+)
 from room3d_worker.common.subprocess_runner import StageResult, run_stage_on_gpu
 
 
@@ -226,7 +237,9 @@ class WorkerClient:
                 time.sleep(self._retry_delay * 2 ** attempt)
         raise WorkerClientError(f"Request retries exhausted for {endpoint}")
 
-    def _upload_chunked(self, root: str, path: str, handle: BinaryIO, size: int) -> dict[str, Any]:
+    def _upload_chunked(
+        self, root: str, path: str, handle: BinaryIO, size: int, *, extract_to: str | None = None,
+    ) -> dict[str, Any]:
         endpoint = f"{root}/uploads/{uuid.uuid4()}"
         digest = hashlib.sha256()
         count = 0
@@ -234,22 +247,87 @@ class WorkerClient:
             digest.update(chunk)
             self._retry_post(f"{endpoint}/parts/{count}", "part", io.BytesIO(chunk))
             count += 1
-        return self._retry_post(f"{endpoint}/complete", body={
+        body: dict[str, object] = {
             "path": path, "part_count": count, "size": size, "sha256": digest.hexdigest(),
-        })
+        }
+        if extract_to is not None:
+            body["extract_to"] = extract_to
+        return self._retry_post(f"{endpoint}/complete", body=body)
+
+    def bundle_index(self, prefix: str, paths: list[str]) -> list[AssetInfo]:
+        result = self._request("GET", f"/api/storage/{prefix}/bundle-index",
+                               params=[("paths", path) for path in paths])
+        return [AssetInfo.model_validate(item) for item in result["objects"]]
+
+    def download_bundle(
+        self, prefix: str, paths: list[str], destination: Path, objects: list[AssetInfo] | None = None,
+    ) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="room3d-download-", dir=destination.parent) as staging:
+            archive = Path(staging) / "bundle.zip"
+            selected = [item for item in objects or [] if any(item.path == path or item.path.startswith(path + "/") for path in paths)]
+            headers = {"If-Match": asset_revision(selected)} if objects is not None else {}
+            self._download(f"/api/storage/{prefix}/bundle.zip", archive, headers=headers,
+                           params=[("paths", path) for path in paths], timeout=300.0)
+            with ZipFile(archive) as bundle:
+                entries = bundle.infolist()
+                if sum(item.file_size for item in entries) > 8_000_000_000 or len(entries) > 20_000:
+                    raise WorkerClientError("Downloaded bundle exceeds expanded size or file count limit")
+                names = [safe_asset_path(item.filename) for item in entries]
+                if len(set(names)) != len(names) or any(stat.S_ISLNK(item.external_attr >> 16) for item in entries):
+                    raise WorkerClientError("Downloaded bundle contains duplicate paths or links")
+                for item, name in zip(entries, names, strict=True):
+                    if item.is_dir():
+                        continue
+                    target = destination / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.open(item) as source, target.open("wb") as output:
+                        shutil.copyfileobj(source, output, 1024 * 1024)
+
+    def upload_bundle(self, prefix: str, files: list[tuple[str, Path]]) -> dict[str, Any]:
+        if not files:
+            return {"objects": []}
+        with cast(BinaryIO, tempfile.TemporaryFile(dir=files[0][1].parent)) as stream:
+            with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=1) as archive:
+                for name, path in files:
+                    archive.write(path, safe_asset_path(name))
+            size = stream.tell()
+            stream.seek(0)
+            if size <= self._upload_chunk_bytes:
+                return self._retry_post(f"/api/storage/{prefix}/upload-bundle", "bundle.zip", stream)
+            project, scope, *rest = prefix.split("/")
+            return self._upload_chunked(f"/api/storage/{project}/{scope}", "bundle.zip", stream, size,
+                                        extract_to="/".join(rest))
 
     def upload_key(self, key: str, source: BinaryIO | Path) -> dict[str, Any]:
         project_id, scope, path = split_storage_key(key)
         return self.upload(project_id, scope, path, source)
 
     def download(self, project_id: str, version_id: str, path: str, destination: Path) -> None:
-        with self._http.stream("GET", f"/api/storage/{project_id}/{version_id}/{path}") as response:
-            if response.status_code >= 400:
-                raise WorkerClientError(f"Storage download failed with {response.status_code}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("wb") as handle:
-                for chunk in response.iter_bytes():
-                    handle.write(chunk)
+        self._download(f"/api/storage/{project_id}/{version_id}/{path}", destination)
+
+    def _download(self, endpoint: str, destination: Path, **kwargs: Any) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        for attempt in range(self._upload_attempts):
+            fd, pending = tempfile.mkstemp(prefix=".download-", dir=destination.parent)
+            try:
+                with os.fdopen(fd, "wb") as output, self._http.stream("GET", endpoint, **kwargs) as response:
+                    if response.status_code == 412:
+                        raise AssetRevisionError("Assets changed; refresh the bundle index")
+                    if response.status_code in {408, 429} or response.status_code >= 500:
+                        raise RetryableWorkerError(f"Storage download temporarily failed with {response.status_code}")
+                    if response.status_code >= 400:
+                        raise WorkerClientError(f"Storage download failed with {response.status_code}")
+                    for chunk in response.iter_bytes():
+                        output.write(chunk)
+                os.replace(pending, destination)
+                return
+            except (httpx.TransportError, RetryableWorkerError) as exc:
+                if attempt + 1 == self._upload_attempts:
+                    raise RetryableWorkerError(f"Storage download retries exhausted: {endpoint}") from exc
+                time.sleep(self._retry_delay * 2 ** attempt)
+            finally:
+                Path(pending).unlink(missing_ok=True)
 
     def download_key(self, key: str, destination: Path) -> None:
         project_id, scope, path = split_storage_key(key)

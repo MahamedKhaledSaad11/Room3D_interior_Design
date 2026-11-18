@@ -50,16 +50,23 @@ def relay_subprocess_progress(path: Path) -> Iterator[dict[str, str]]:
         try:
             with path.open(encoding="utf-8") as stream:
                 while True:
-                    position = stream.tell()
-                    line = stream.readline()
-                    if line.endswith("\n"):
-                        if callback:
-                            callback(ProgressEvent.model_validate_json(line))
-                        continue
-                    stream.seek(position)
+                    latest: dict[str, ProgressEvent] = {}
+                    while True:
+                        position = stream.tell()
+                        line = stream.readline()
+                        if not line.endswith("\n"):
+                            stream.seek(position)
+                            break
+                        event = ProgressEvent.model_validate_json(line)
+                        latest[event.stage] = event
+                    if callback:
+                        for event in latest.values():
+                            callback(event)
                     if stopped.is_set():
-                        return
-                    stopped.wait(0.25)
+                        if not latest:
+                            return
+                        continue
+                    stopped.wait(1.0)
         except Exception as exc:
             errors.append(exc)
 

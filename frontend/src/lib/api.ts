@@ -15,7 +15,7 @@ export interface Telemetry { vram_used_mb?: number; vram_total_mb?: number; runt
 export interface SceneVersion { id: string; label: string; parent_version_id: string | null; created_at: string; }
 export interface ProjectDetail extends Project { versions: Array<{ id: string; label: string }>; tasks: TaskSummary[]; edit_sessions: EditSession[]; }
 export interface MaskSummaryEntry { frame_idx: number; mask_key?: string | null; status?: string; skip_frame?: boolean; }
-export interface EditSession { id: string; status?: string; base_version_id?: string | null; target_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; }
+export interface EditSession { id: string; status?: string; base_version_id?: string | null; target_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; mask_revision?: number; }
 export interface ResolveClickBody {
   screenX?: number;
   screenY?: number;
@@ -161,7 +161,7 @@ export class RoomApi {
     chosen_seed_id: string,
     rebuild_mode: RebuildMode,
     prompt?: string,
-    options?: { model_variant?: DiffusionModelVariant; negative_prompt?: string },
+    options?: { model_variant?: DiffusionModelVariant; negative_prompt?: string; rebuild_safeguards?: boolean; unmasked_weight?: number },
   ): Promise<TaskSummary & { edit_id: string; target_version_id: string; diffusion_task_id: string }> {
     const body: {
       chosen_seed_id: string;
@@ -169,9 +169,13 @@ export class RoomApi {
       prompt?: string;
       model_variant?: DiffusionModelVariant;
       negative_prompt?: string;
+      rebuild_safeguards?: boolean;
+      unmasked_weight?: number;
     } = { chosen_seed_id, rebuild_mode, prompt };
     if (options?.model_variant) body.model_variant = options.model_variant;
     if (options?.negative_prompt) body.negative_prompt = options.negative_prompt;
+    if (options?.rebuild_safeguards !== undefined) body.rebuild_safeguards = options.rebuild_safeguards;
+    if (options?.unmasked_weight !== undefined) body.unmasked_weight = options.unmasked_weight;
     return request(this.path(`/api/edits/${encodeURIComponent(editId)}/apply`), this.token, { method: "POST", body: JSON.stringify(body) });
   }
   edits(projectId: string): Promise<EditSummaryItem[]> { return request(this.path(`/api/projects/${encodeURIComponent(projectId)}/edits`), this.token); }
@@ -192,4 +196,3 @@ export class RoomApi {
 }
 
 export const roomApi = new RoomApi();
-

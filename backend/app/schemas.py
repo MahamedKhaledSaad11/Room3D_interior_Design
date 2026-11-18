@@ -70,6 +70,14 @@ class ApplyEditRequest(BaseModel):
     prompt: str | None = Field(default=None, max_length=1000)
     negative_prompt: str | None = Field(default=None, max_length=1000)
     model_variant: Literal["flux2_klein_4b", "sdxl_inpaint_t4"] | None = None
+    rebuild_safeguards: bool = False
+    unmasked_weight: float = Field(default=1.0, ge=1.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def check_safeguard_mode(self) -> ApplyEditRequest:
+        if self.rebuild_safeguards and self.rebuild_mode != "masked_finetune":
+            raise ValueError("Background-preserving safeguards require masked_finetune mode")
+        return self
 
 
 class TaskViewResponse(BaseModel):
@@ -123,6 +131,7 @@ class EditSessionOut(BaseModel):
     status: str
     preview_seeds: dict[str, str] = Field(default_factory=dict)
     masks_summary: dict[str, Any] = Field(default_factory=dict)
+    mask_revision: int = 0
     created_at: datetime | None
     updated_at: datetime | None
 

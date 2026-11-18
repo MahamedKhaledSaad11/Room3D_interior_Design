@@ -27,6 +27,17 @@ describe("task polling", () => {
 });
 
 describe("progress panel", () => {
+  it("updates live diffusion and rebuild task percentages", () => {
+    const { rerender } = render(<ProgressPanel taskType="diffusion_apply" progress={10} stage="06_diffusion" status="running" message="Loading edit assets" />);
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "10");
+    rerender(<ProgressPanel taskType="diffusion_apply" progress={64} stage="06_diffusion" status="running" message="Editing frame 10/16" />);
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "64");
+    expect(screen.getByText("Editing frame 10/16")).toBeInTheDocument();
+    rerender(<ProgressPanel taskType="rebuild_week2" progress={95} stage="07_rebuild" status="running" message="Rebuilding 3DGS step 5000/5000" />);
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "95");
+    expect(screen.getByText("Rebuilding edited scene")).toBeInTheDocument();
+  });
+
   it("renders the current percentage and stage", () => {
     render(<ProgressPanel progress={45} stage="02_poses" status="running" message="Aligning cameras" />);
     expect(screen.getByText("45%")).toBeInTheDocument();

@@ -157,6 +157,7 @@ def _edit_to_schema(edit: EditSession) -> EditSessionOut:
         status=edit.status,
         preview_seeds=dict(edit.preview_seeds_json or {}),
         masks_summary=json.loads(edit.masks_summary_json or "{}"),
+        mask_revision=int(edit.mask_revision or 0),
         created_at=edit.created_at,
         updated_at=edit.updated_at,
     )
@@ -605,6 +606,8 @@ def apply_edit(
         "exclude_frames": exclude_frames,
         "target_version_id": target_version_id,
         "new_version_id": target_version_id,
+        "rebuild_safeguards": body.rebuild_safeguards,
+        "unmasked_weight": body.unmasked_weight,
     }
     diffusion_task = Task(
         project_id=edit.project_id,

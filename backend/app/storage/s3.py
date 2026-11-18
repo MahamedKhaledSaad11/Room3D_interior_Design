@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import BinaryIO
 
-from .base import StorageDriver, validate_key
+from .base import StorageDriver, StorageObject, validate_key
 
 
 class _CountingReader:
@@ -28,6 +28,15 @@ class S3Storage(StorageDriver):
 
     def safe_resolve(self, key: str) -> Path:
         return Path(validate_key(key))
+
+    def list_objects(self, prefix: str) -> list[StorageObject]:
+        normalized = validate_key(prefix).rstrip("/") + "/"
+        result: list[StorageObject] = []
+        for page in self.client.get_paginator("list_objects_v2").paginate(Bucket=self.bucket, Prefix=normalized):
+            for item in page.get("Contents", []):
+                if not item["Key"].endswith("/"):
+                    result.append(StorageObject(item["Key"], item["Size"], item["ETag"].strip('"')))
+        return sorted(result, key=lambda item: item.key)
 
     def put_stream(self, key: str, stream: BinaryIO, chunk_size: int = 1024 * 1024) -> int:
         del chunk_size

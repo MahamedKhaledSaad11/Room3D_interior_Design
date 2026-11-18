@@ -76,10 +76,17 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
 
   useEffect(() => {
     if (!projectId || !hasActiveTasks) return;
+    let cancelled = false;
+    let refreshing = false;
     const timer = window.setInterval(() => {
-      void roomApi.getProject(projectId).then(setProject).catch(() => undefined);
+      if (refreshing) return;
+      refreshing = true;
+      void roomApi.getProject(projectId)
+        .then((next) => { if (!cancelled) setProject(next); })
+        .catch(() => undefined)
+        .finally(() => { refreshing = false; });
     }, 2500);
-    return () => window.clearInterval(timer);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [projectId, hasActiveTasks]);
 
   return (
@@ -115,6 +122,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
             <aside className="studio-sidebar">
               {task ? (
                 <ProgressPanel
+                  taskType={task.type}
                   progress={task.progress_pct}
                   stage={task.stage}
                   status={task.status}

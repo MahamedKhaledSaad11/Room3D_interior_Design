@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import inspect
-import logging
 import json
+import logging
 import os
 import shutil
 import struct
@@ -11,13 +11,22 @@ import tempfile
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
-from room3d_worker.client import RetryableWorkerError, StaleAttemptError, TaskClaim, WorkerClient, WorkerClientError
+from room3d_worker.client import (
+    RetryableWorkerError,
+    StaleAttemptError,
+    TaskClaim,
+    WorkerClient,
+    WorkerClientError,
+)
+from room3d_worker.common.asset_cache import DiskAssetCache
+from room3d_worker.common.assets import AssetInfo, AssetRevisionError
 from room3d_worker.common.errors import StageExecutionError
 from room3d_worker.common.manifest import SceneManifest, load_manifest
 from room3d_worker.common.progress import ProgressEvent, progress_sink, relay_subprocess_progress
@@ -44,7 +53,12 @@ from room3d_worker.pipeline.s06_diffusion import (
     load_diffusion_backend,
     propagate_masked_edits,
 )
-from room3d_worker.pipeline.s07_rebuild import ArrayBool, GaussianState, RebuildRequest, rebuild_scene
+from room3d_worker.pipeline.s07_rebuild import (
+    ArrayBool,
+    GaussianState,
+    RebuildRequest,
+    rebuild_scene,
+)
 from room3d_worker.stage_cli import load_sparse_points
 
 
@@ -122,9 +136,54 @@ class WorkerBackends:
 
 
 class _StorageAccessor:
-    def __init__(self, client: WorkerClient, storage_dir: Path | None) -> None:
+    def __init__(self, client: WorkerClient, storage_dir: Path | None, cache_root: Path) -> None:
         self._client = client
         self._storage_dir = storage_dir.resolve() if storage_dir is not None else None
+        self.cache = DiskAssetCache(cache_root)
+        self.validated: set[str] = set()
+
+    def prepare(self, prefix: str, paths: list[str], destination: Path) -> list[AssetInfo]:
+        if self._storage_dir is not None:
+            from room3d_worker.common.assets import safe_asset_path
+
+            source = self._local_path(prefix)
+            assert source is not None
+            for component in paths:
+                target = source / safe_asset_path(component)
+                files = [target] if target.is_file() else target.rglob("*")
+                for file in files:
+                    if file.is_file():
+                        relative = file.relative_to(source)
+                        dest = destination / relative
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(file, dest)
+            return []
+        for attempt in range(3):
+            objects = self._client.bundle_index(prefix, paths)
+            try:
+                downloader = partial(self._client.download_bundle, prefix, objects=objects)
+                self.cache.sync(prefix, objects, destination, downloader, paths)
+                self.validated.add(prefix)
+                return objects
+            except AssetRevisionError as exc:
+                if attempt == 2:
+                    raise RetryableWorkerError(f"Assets kept changing while downloading {prefix}") from exc
+        raise WorkerClientError(f"Unable to synchronize assets for {prefix}")
+
+    def put_many(self, files: list[tuple[str, Path]]) -> None:
+        if self._storage_dir is not None:
+            for key, path in files:
+                self.put(key, path)
+            return
+        groups: dict[str, list[tuple[str, Path]]] = {}
+        for key, path in files:
+            parts = key.split("/")
+            count = 3 if parts[1] == "edits" else 2
+            prefix, name = "/".join(parts[:count]), "/".join(parts[count:])
+            groups.setdefault(prefix, []).append((name, path))
+        for prefix, assets in groups.items():
+            # Acknowledgement metadata can race with later mask writes; consumers cache a fenced download.
+            self._client.upload_bundle(prefix, assets)
 
     def _local_path(self, key: str) -> Path | None:
         if self._storage_dir is None:
@@ -144,7 +203,11 @@ class _StorageAccessor:
             if local != dest.resolve():
                 shutil.copy2(local, dest)
             return dest
-        self._client.download_key(key, dest)
+        parts = key.split("/")
+        mutable = len(parts) > 2 and parts[1] == "edits"
+        cache_valid = not mutable or "/".join(parts[:3]) in self.validated
+        if not cache_valid or not self.cache.copy(key, dest):
+            self._client.download_key(key, dest)
         return dest
 
     def try_fetch(self, key: str, dest: Path) -> Path | None:
@@ -210,12 +273,14 @@ class WorkerRunner:
         poll_interval_sec: float = 0.5,
         heartbeat_interval_sec: float = 15.0,
         stage_timeout_sec: int = 3600,
+        cache_root: Path | None = None,
     ) -> None:
         self.client = client
         self.worker_id = worker_id
         self.work_root = Path(work_root) if work_root is not None else Path(tempfile.mkdtemp(prefix="room3d_work_"))
         self.work_root.mkdir(parents=True, exist_ok=True)
-        self.storage = _StorageAccessor(client, storage_dir)
+        cache_root = cache_root or Path(os.environ.get("ROOM3D_CACHE_ROOT", str(Path(tempfile.gettempdir()) / "room3d_cache")))
+        self.storage = _StorageAccessor(client, storage_dir, cache_root)
         self.capabilities = list(capabilities or [])
         self.interactive_only = interactive_only
         self.backends = backends or WorkerBackends()
@@ -254,7 +319,8 @@ class WorkerRunner:
             self.client.heartbeat(task, self.worker_id)
             stop_hb, hb_thread = self._start_heartbeat(task)
             def publish(event: ProgressEvent) -> None:
-                self.client.progress(task, event.stage, event.percent * 0.9, event.message, event.telemetry)
+                percent = event.percent if event.stage in {"06_diffusion", "07_rebuild"} else event.percent * 0.9
+                self.client.progress(task, event.stage, min(95, percent), event.message, event.telemetry)
 
             with progress_sink(publish):
                 result_payload, manifest_key = self.execute_claim(task)
@@ -295,6 +361,7 @@ class WorkerRunner:
         return processed
 
     def execute_claim(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
+        self.storage.validated.clear()
         dispatch = {
             "reconstruct_week1": self._handle_week1,
             "build_week1": self._handle_week1,
@@ -332,19 +399,17 @@ class WorkerRunner:
         return json.loads(out_path.read_text(encoding="utf-8"))
 
     def _fetch_manifest(self, manifest_key: str, dest_dir: Path) -> SceneManifest:
-        manifest_path = self.storage.fetch(manifest_key, dest_dir / "manifest.json")
-        return load_manifest(manifest_path)
+        prefix, name = manifest_key.rsplit("/", 1)
+        self.storage.prepare(prefix, [name], dest_dir)
+        return load_manifest(dest_dir / name)
+
+    def _prepare_scene(self, project_id: str, version_id: str, dest_dir: Path, paths: list[str]) -> SceneManifest:
+        self.storage.prepare(f"{project_id}/{version_id}", ["manifest.json", *paths], dest_dir)
+        return load_manifest(dest_dir / "manifest.json")
 
     def _fetch_depths(self, project_id: str, version_id: str, manifest: SceneManifest, scene_dir: Path) -> bool:
-        found = False
-        for frame in manifest.frames:
-            index = frame.frame_idx
-            target = scene_dir / "depths" / f"{index:06d}.npy"
-            for filename in (f"{index:06d}.npy", f"{index:05d}.npy"):
-                if self.storage.try_fetch(f"{project_id}/{version_id}/depths/{filename}", target) is not None:
-                    found = True
-                    break
-        return found
+        self.storage.prepare(f"{project_id}/{version_id}", ["depths"], scene_dir)
+        return any((scene_dir / "depths").glob("*.npy"))
 
     def _handle_week1(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
         payload = task.payload
@@ -473,10 +538,11 @@ class WorkerRunner:
         return {"version_id": version_id, "label": payload.get("label") or version_id, "manifest_key": manifest_key}, manifest_key
 
     def _upload_files(self, task: TaskClaim, stage: str, files: list[tuple[str, Path]]) -> None:
-        for index, (key, path) in enumerate(files, 1):
-            self.storage.put(key, path)
-            self.client.progress(task, stage, 90 + 10 * index / len(files),
-                                 f"Uploaded artifact {index}/{len(files)}: {path.name}")
+        if not files:
+            return
+        self.client.progress(task, stage, 95, f"Uploading lossless bundle of {len(files)} artifacts")
+        self.storage.put_many(files)
+        self.client.progress(task, stage, 99, f"Uploaded {len(files)} artifacts")
 
     def _upload_scene_bundle(self, task: TaskClaim, project_id: str, version_id: str, scene_dir: Path, manifest: SceneManifest) -> None:
         for required in ("scene.spz", "manifest.json"):
@@ -499,6 +565,10 @@ class WorkerRunner:
         if depths_dir.is_dir():
             for npy in depths_dir.glob("*.npy"):
                 files.append((f"{project_id}/{version_id}/depths/{npy.name}", npy))
+        for folder in ("thumbnails", "thumbs"):
+            for path in (scene_dir / folder).rglob("*"):
+                if path.is_file():
+                    files.append((f"{project_id}/{version_id}/{path.relative_to(scene_dir).as_posix()}", path))
         self._upload_files(task, "04_export" if task.task_type in {"reconstruct", "reconstruct_week1", "build_week1"} else "07_rebuild", files)
 
     def _handle_segment(self, task: TaskClaim) -> tuple[dict[str, Any], str | None]:
@@ -548,23 +618,22 @@ class WorkerRunner:
         edit_id = str(payload["edit_id"])
         base_version_id = str(payload["base_version_id"])
         ref_idx = int(payload.get("ref_frame_idx") or 0)
-        manifest_key = payload.get("manifest_key") or f"{project_id}/{base_version_id}/manifest.json"
         masks_prefix = str(payload.get("masks_prefix") or f"{project_id}/edits/{edit_id}/masks")
 
         work_dir = self.work_root / task.task_id
         scene_dir = work_dir / "base"
-        manifest = self._fetch_manifest(manifest_key, scene_dir)
+        manifest = self._prepare_scene(project_id, base_version_id, scene_dir, ["images", "depths"])
         image_paths: dict[int, Path] = {}
         for frame in manifest.frames:
             if not frame.excluded:
-                image_paths[frame.frame_idx] = self.storage.fetch(
-                    f"{project_id}/{base_version_id}/{frame.image_relpath}", scene_dir / frame.image_relpath
-                )
+                image_paths[frame.frame_idx] = scene_dir / frame.image_relpath
 
         depth_dir = scene_dir / "depths"
-        has_depths = self._fetch_depths(project_id, base_version_id, manifest, scene_dir)
+        has_depths = any(depth_dir.glob("*.npy"))
 
         corrections: dict[str, Any] = payload.get("keyframe_corrections") or payload.get("keyframe_Corrections") or {}
+        if corrections:
+            self.storage.prepare(f"{project_id}/edits/{edit_id}", ["masks"], work_dir / "edit")
         overrides: list[ManualOverride] = []
         for idx_str, entry in corrections.items():
             if not isinstance(entry, dict):
@@ -658,6 +727,7 @@ class WorkerRunner:
         ref_rel = next(f.image_relpath for f in manifest.frames if f.frame_idx == ref_idx)
         ref_img = self.storage.fetch(f"{project_id}/{base_version_id}/{ref_rel}", work_dir / "ref_img.png")
         mask_key = str(payload.get("mask_key") or f"{project_id}/edits/{edit_id}/masks/{ref_idx:06d}.png")
+        self.storage.prepare(f"{project_id}/edits/{edit_id}", ["masks"], work_dir / "edit")
         ref_mask = self.storage.fetch(mask_key, work_dir / "ref_mask.png")
 
         seeds = [int(s) for s in payload.get("seeds", [101, 202, 303, 404])]
@@ -708,12 +778,12 @@ class WorkerRunner:
         edit_id = str(payload["edit_id"])
         base_version_id = str(payload["base_version_id"])
         ref_idx = int(payload.get("ref_frame_idx") or 0)
-        manifest_key = payload.get("manifest_key") or f"{project_id}/{base_version_id}/manifest.json"
         masks_prefix = str(payload.get("masks_prefix") or f"{project_id}/edits/{edit_id}/masks")
         edited_prefix = str(payload.get("edited_frames_prefix") or f"{project_id}/edits/{edit_id}/edited_frames")
 
         work_dir = self.work_root / task.task_id
-        manifest = self._fetch_manifest(manifest_key, work_dir / "base")
+        manifest = self._prepare_scene(project_id, base_version_id, work_dir / "base", ["images"])
+        self.storage.prepare(f"{project_id}/edits/{edit_id}", ["masks"], work_dir / "edit")
         frame_paths: dict[int, Path] = {}
         mask_paths: dict[int, Path] = {}
         masks_summary: dict[str, Any] = dict(payload.get("masks_summary") or {})
@@ -721,13 +791,16 @@ class WorkerRunner:
             if frame.excluded:
                 continue
             idx = frame.frame_idx
-            frame_paths[idx] = self.storage.fetch(
-                f"{project_id}/{base_version_id}/{frame.image_relpath}", work_dir / "frames" / f"{idx:06d}.png"
-            )
+            frame_paths[idx] = work_dir / "base" / frame.image_relpath
             mkey = (masks_summary.get(str(idx)) or {}).get("mask_key") or f"{masks_prefix}/{idx:06d}.png"
-            fetched_mask = self.storage.try_fetch(str(mkey), work_dir / "masks" / f"{idx:06d}.png")
-            if fetched_mask is not None:
-                mask_paths[idx] = fetched_mask
+            canonical = f"{masks_prefix}/{idx:06d}.png"
+            mask = work_dir / "edit" / "masks" / f"{idx:06d}.png"
+            if str(mkey) != canonical:
+                fetched = self.storage.try_fetch(str(mkey), mask)
+                if fetched is not None:
+                    mask_paths[idx] = fetched
+            elif mask.is_file():
+                mask_paths[idx] = mask
 
         preview_key = str(payload["preview_key"])
         ref_edited = self.storage.fetch(preview_key, work_dir / "ref_edited.png")
@@ -736,7 +809,7 @@ class WorkerRunner:
         variant = payload.get("model_variant") or "flux2_klein_4b"
         negative_prompt = payload.get("negative_prompt")
 
-        self.client.progress(task, "06_diffusion", 0.0, "Applying reference-conditioned edits")
+        self.client.progress(task, "06_diffusion", 10.0, "Applying reference-conditioned edits")
         if self.backends.use_isolated_subprocesses and self.backends.inpaint_backend is None:
             metrics = self._run_isolated(
                 "diffusion_apply",
@@ -784,31 +857,27 @@ class WorkerRunner:
         edit_id = str(payload["edit_id"])
         base_version_id = str(payload["base_version_id"])
         new_version_id = str(payload.get("new_version_id") or payload.get("target_version_id") or f"edit_{edit_id[:8]}")
-        manifest_key = payload.get("manifest_key") or f"{project_id}/{base_version_id}/manifest.json"
         masks_prefix = str(payload.get("masks_prefix") or f"{project_id}/edits/{edit_id}/masks")
-        edited_prefix = str(payload.get("edited_frames_prefix") or f"{project_id}/edits/{edit_id}/edited_frames")
 
         work_dir = self.work_root / task.task_id
         base_dir = work_dir / "base"
-        edited_dir = work_dir / "edited_frames"
-        masks_dir = work_dir / "masks"
+        edited_dir = work_dir / "edit" / "edited_frames"
+        masks_dir = work_dir / "edit" / "masks"
         out_dir = work_dir / "rebuilt"
         edited_dir.mkdir(parents=True, exist_ok=True)
         masks_dir.mkdir(parents=True, exist_ok=True)
 
-        manifest = self._fetch_manifest(manifest_key, base_dir)
-        self._fetch_depths(project_id, base_version_id, manifest, base_dir)
-        for rel in ("gs_state.npz", "gs_ckpt.pt", "scene.ply", "sparse/0/cameras.bin", "sparse/0/images.bin", "sparse/0/points3D.bin"):
-            self.storage.try_fetch(f"{project_id}/{base_version_id}/{rel}", base_dir / rel)
+        manifest = self._prepare_scene(project_id, base_version_id, base_dir,
+                                       ["images", "depths", "gs_state.npz", "gs_ckpt.pt", "scene.ply", "sparse"])
+        self.storage.prepare(f"{project_id}/edits/{edit_id}", ["masks", "edited_frames"], work_dir / "edit")
         masks_summary: dict[str, Any] = dict(payload.get("masks_summary") or {})
         for frame in manifest.frames:
             idx = frame.frame_idx
-            self.storage.try_fetch(f"{project_id}/{base_version_id}/{frame.image_relpath}", base_dir / frame.image_relpath)
-            self.storage.try_fetch(f"{edited_prefix}/{idx:06d}.png", edited_dir / f"{idx:06d}.png")
             mkey = (masks_summary.get(str(idx)) or {}).get("mask_key") or f"{masks_prefix}/{idx:06d}.png"
-            self.storage.try_fetch(str(mkey), masks_dir / f"{idx:06d}.png")
+            if str(mkey) != f"{masks_prefix}/{idx:06d}.png":
+                self.storage.try_fetch(str(mkey), masks_dir / f"{idx:06d}.png")
 
-        self.client.progress(task, "07_rebuild", 0.0, "Rebuilding 3D Gaussian scene")
+        self.client.progress(task, "07_rebuild", 10.0, "Rebuilding 3D Gaussian scene")
         exclude_frames = tuple(int(i) for i in payload.get("exclude_frames", []))
         mode = payload.get("rebuild_mode", "masked_finetune")
         if self.backends.use_isolated_subprocesses and self.backends.rebuild_backend is None:
@@ -823,6 +892,8 @@ class WorkerRunner:
                     "version_id": new_version_id,
                     "parent_version_id": base_version_id,
                     "mode": mode,
+                    "rebuild_safeguards": bool(payload.get("rebuild_safeguards", False)),
+                    "unmasked_weight": float(payload.get("unmasked_weight", 1.0)),
                     "exclude_frames": list(exclude_frames),
                     "device": "cuda:0",
                 },
@@ -840,6 +911,8 @@ class WorkerRunner:
                 version_id=new_version_id,
                 parent_version_id=base_version_id,
                 mode=mode,
+                rebuild_safeguards=bool(payload.get("rebuild_safeguards", False)),
+                unmasked_weight=float(payload.get("unmasked_weight", 1.0)),
                 exclude_frames=exclude_frames,
                 device="cpu" if self.backends.rebuild_backend is not None else _stage_device(1),
             )

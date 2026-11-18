@@ -748,7 +748,7 @@ class VGGTChunkedBackend:
                 if (new_w, new_h) != (width, height) and depth_arr.shape == (height, width):
                     depth_arr = depth_arr[y0:y1, x0:x1]
                 depth_arr = np.asarray(depth_arr, dtype=np.float32)
-                np.save(out_depth_dir / f"{f_idx:05d}.npy", depth_arr, allow_pickle=False)
+                np.save(out_depth_dir / f"{f_idx:06d}.npy", depth_arr, allow_pickle=False)
                 cropped_list.append(depth_arr)
             if cropped_list:
                 final_depths = np.stack(cropped_list, axis=0)
