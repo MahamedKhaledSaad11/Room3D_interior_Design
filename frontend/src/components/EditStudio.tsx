@@ -125,7 +125,9 @@ export default function EditStudio({
   onJumpToFrame,
 }: EditStudioProps) {
   const [editMode, setEditMode] = useState(false);
-  const [preferredSelectionMode, setSelectionMode] = useState<"3d" | "2d">("3d");
+  const [preferredSelectionMode, setSelectionMode] = useState<"3d" | "2d">("2d");
+  const [step, setStep] = useState(1);
+  const [reviewedRevision, setReviewedRevision] = useState<number | null>(null);
   const [requestedPickerFrameIdx, setPickerFrameIdx] = useState<number>(0);
   const [editId, setEditId] = useState<string | null>(null);
   const [editSession, setEditSession] = useState<EditSession | null>(null);
@@ -147,6 +149,11 @@ export default function EditStudio({
   const framesRevisionRef = useRef("");
   const [statusMessage, setStatusMessage] = useState("");
   const [error, setError] = useState("");
+  const blocked = project.processing_status !== undefined && project.processing_status !== "running";
+  const processing = Boolean(editSession?.status && ACTIVE_EDIT_STATUSES.has(editSession.status));
+  const operationBusy = busy || blocked || processing;
+  const coverage = framesData?.coverage;
+  const masksReviewed = coverage?.ready === true && reviewedRevision === maskRevision;
 
   const editManifest = useMemo(
     () => (editSession?.base_version_id && editSession.base_version_id !== activeVersionId
@@ -206,6 +213,8 @@ export default function EditStudio({
     async (payload: Parameters<typeof roomApi.resolveClick>[1]) => {
       const res = await roomApi.resolveClick(projectId, payload);
       setEditId(res.edit_id);
+      setStep(1);
+      setReviewedRevision(null);
       setEditSession({ id: res.edit_id, status: "segmenting", base_version_id: activeVersionId, ref_frame_idx: res.ref_frame_idx });
       setInitialRefFrameIdx(res.ref_frame_idx);
       setRefFrameIdx(res.ref_frame_idx);
@@ -233,11 +242,11 @@ export default function EditStudio({
   );
 
   useEffect(() => {
-    if (!controller || !editMode || selectionMode !== "3d") return;
+    if (!controller || !editMode || editId || selectionMode !== "3d") return;
     return controller.onUserClick((click) => {
       void handleViewerClick(click);
     });
-  }, [controller, editMode, handleViewerClick, selectionMode]);
+  }, [controller, editId, editMode, handleViewerClick, selectionMode]);
 
   useEffect(() => {
     if (!editId || !pollingEdit) return;
@@ -295,7 +304,13 @@ export default function EditStudio({
   }, [chosenSeed, editId, framesData?.page, loadFrames, pollingEdit, projectId, onRefreshProject, onSelectVersion]);
 
   const handlePickerImageClick = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (busy) return;
+    if (operationBusy) return;
+    if (editId) {
+      setRefFrameIdx(pickerFrameIdx);
+      setPoints([]);
+      setStatusMessage("Use the selection canvas below to add or remove parts of this object.");
+      return;
+    }
     const rect = event.currentTarget.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
     const u_norm = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
@@ -327,6 +342,8 @@ export default function EditStudio({
       setPoints((prev) => [...prev, pt]);
       setEditSession((prev) => (prev ? { ...prev, preview_seeds: {} } : prev));
       setPreviewSignature(null);
+      setReviewedRevision(null);
+      setEditSession((prev) => prev ? { ...prev, status: "segmenting" } : prev);
       setStatusMessage("Refined segmentation mask.");
       setPollingEdit(true);
       notifyTasks();
@@ -337,7 +354,9 @@ export default function EditStudio({
     if (!editId) return;
     await runAction(async () => {
       await roomApi.track(editId);
-      setEditSession((prev) => (prev ? { ...prev, preview_seeds: {} } : prev));
+      setEditSession((prev) => (prev ? { ...prev, preview_seeds: {}, status: "tracking" } : prev));
+      setStep(2);
+      setReviewedRevision(null);
       setPreviewSignature(null);
       setStatusMessage("Queued cross-frame tracking.");
       setPollingEdit(true);
@@ -347,6 +366,7 @@ export default function EditStudio({
   };
 
   const invalidateMasksAndSync = async (targetEditId: string) => {
+    setReviewedRevision(null);
     setPreviewSignature(null);
     pendingPreviewSigRef.current = null;
     setMaskRevision((v) => v + 1);
@@ -405,6 +425,10 @@ export default function EditStudio({
   };
 
   const handleApplyRebuild = async () => {
+    if (!masksReviewed) {
+      setError("Track and review all views before applying the edit to the room.");
+      return;
+    }
     if (!editId || !prompt.trim()) {
       setError("Enter a prompt and choose a seed before applying rebuild.");
       return;
@@ -420,7 +444,9 @@ export default function EditStudio({
       const res = extraOpts
         ? await roomApi.applyEdit(editId, selectedSeedValue, rebuildMode, prompt.trim(), extraOpts)
         : await roomApi.applyEdit(editId, selectedSeedValue, rebuildMode, prompt.trim());
-      setStatusMessage(`Rebuild queued for version ${res.target_version_id}`);
+      setStatusMessage("Applying your edit across all views, then rebuilding the room.");
+      setStep(4);
+      setEditSession((prev) => prev ? { ...prev, status: "rebuilding", target_version_id: res.target_version_id } : prev);
       setPollingEdit(true);
       notifyTasks();
       await onRefreshProject();
@@ -459,21 +485,47 @@ export default function EditStudio({
     : DEFAULT_SEEDS.map((s) => `seed_${s}`);
   const stalePreviews = previewSignature !== null && previewSignature !== currentSignature;
   const applyDisabled =
-    busy
+    operationBusy
+    || !masksReviewed
     || stalePreviews
     || previewEntries.length === 0
     || !resolvedSeedKey
     || editSession?.status === "previewing";
 
   return (
-    <section className="glass-card" aria-label="Week 2 Edit Studio" style={{ padding: "16px", display: "grid", gap: "14px" }}>
+    <section className="glass-card edit-studio" aria-label="Room Edit Studio" style={{ padding: "16px", display: "grid", gap: "14px" }}>
+      <div><p className="eyebrow">EDIT YOUR ROOM</p><h2>One object, every view</h2>
+        <p className="hint-text">Select all parts you want to change, then check the selection from different angles.</p></div>
+      <nav className="edit-steps" aria-label="Edit steps">
+        {["Select object", "Review views", "Preview look", "Build room"].map((label, index) => <button
+          key={label} aria-current={step === index + 1 ? "step" : undefined}
+          disabled={index > 0 && !editId || index === 2 && !masksReviewed || index === 3 && !editSession?.target_version_id}
+          onClick={() => setStep(index + 1)}><span>{index + 1}</span>{label}</button>)}
+      </nav>
+      {project.edit_sessions.length > 0 && !editId && <label>Continue a previous edit
+        <select aria-label="Continue previous edit" value="" onChange={(event) => {
+          const previous = project.edit_sessions.find((entry) => entry.id === event.target.value);
+          if (!previous) return;
+          setEditId(previous.id); setEditSession(previous); setMaskRevision(previous.mask_revision ?? 0);
+          setRefFrameIdx(previous.ref_frame_idx ?? 0); setInitialRefFrameIdx(previous.ref_frame_idx ?? 0);
+          setPrompt(previous.prompt ?? ""); setPoints([]); setPollingEdit(true);
+          setStep(previous.status === "completed" ? 4 : 1);
+          void runAction(() => loadFrames(previous.id));
+        }}><option value="">Choose an edit…</option>{project.edit_sessions.map((entry, index) => <option key={entry.id} value={entry.id}>
+          {entry.prompt || `Object edit ${project.edit_sessions.length - index}`} · {entry.status}
+        </option>)}</select></label>}
+      {editId && <button disabled={operationBusy} onClick={() => {
+        setEditId(null); setEditSession(null); setFramesData(null); setPollingEdit(false);
+        setPoints([]); setStep(1); setPreviewSignature(null); setReviewedRevision(null); setStatusMessage("");
+      }}>Select a different object</button>}
+      {blocked && <p role="status" className="hint-text">Processing is {project.processing_status}. Use the project controls above to continue.</p>}
+      {step === 1 && <>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
         <div>
-          <p className="eyebrow">WEEK 2 EDIT STUDIO</p>
-          <strong>Interactive Object Editing</strong>
+          <strong>1. Select the object</strong>
         </div>
         <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-          <button
+          {!editId && <button
             type="button"
             aria-pressed={editMode && selectionMode === "3d"}
             onClick={() => {
@@ -491,8 +543,8 @@ export default function EditStudio({
               borderWidth: "2px",
             }}
           >
-            {editMode ? "🎯 Edit Object Mode: ON (Selection Active)" : "✏️ Edit Object Mode: OFF (Click to Enable)"}
-          </button>
+            {editMode ? "Selection in 3D is on" : "Select in 3D"}
+          </button>}
           {pickerFrames.length > 0 ? (
             <button
               type="button"
@@ -500,7 +552,7 @@ export default function EditStudio({
               onClick={() => setSelectionMode((m) => (m === "2d" ? "3d" : "2d"))}
               style={{ fontSize: "12px", padding: "8px 10px" }}
             >
-              {selectionMode === "2d" ? "2D Frame Picker: ON" : "2D Frame Picker"}
+              {selectionMode === "2d" ? "Hide video frames" : "Choose from video"}
             </button>
           ) : null}
         </div>
@@ -522,7 +574,7 @@ export default function EditStudio({
               </select>
             </label>
             <button type="button" onClick={handleJumpToPickerFrame}>
-              Snap 3D Camera to Frame
+              View this camera angle
             </button>
           </div>
           <div
@@ -532,8 +584,13 @@ export default function EditStudio({
             data-testid="frame-picker-canvas"
             onClick={handlePickerImageClick}
             onKeyDown={(e) => {
-              if ((e.key === "Enter" || e.key === " ") && !busy) {
+              if ((e.key === "Enter" || e.key === " ") && !operationBusy) {
                 e.preventDefault();
+                if (editId) {
+                  setRefFrameIdx(pickerFrameIdx);
+                  setPoints([]);
+                  return;
+                }
                 void runAction(() =>
                   startEditFromResolve({
                     frame_idx: pickerFrameIdx,
@@ -567,26 +624,16 @@ export default function EditStudio({
         </p>
       ) : null}
 
+      </>}
       {project.versions.length > 0 ? (
         <div role="group" aria-label="Scene Version Switcher" style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
-          <span>A/B Versions:</span>
-          {project.versions.map((ver) => {
-            const active = ver.id === activeVersionId;
-            return (
-              <button
-                key={ver.id}
-                type="button"
-                aria-pressed={active}
-                onClick={() => {
-                  onSelectVersion(ver.id);
-                  controller?.setActiveVersion(ver.id);
-                }}
-                style={{ borderColor: active ? "#2dd4bf" : undefined }}
-              >
-                {ver.label || ver.id}
-              </button>
-            );
-          })}
+          <label>Viewing room version<select aria-label="Room version" value={activeVersionId ?? ""} onChange={(event) => {
+            onSelectVersion(event.target.value); controller?.setActiveVersion(event.target.value);
+          }}>
+            {project.versions.map((version, index) => <option key={version.id} value={version.id}>
+              {/^[0-9a-f-]{36}$/i.test(version.label) ? `Room version ${index + 1}` : version.label || `Room version ${index + 1}`}
+            </option>)}
+          </select></label>
         </div>
       ) : null}
 
@@ -605,7 +652,7 @@ export default function EditStudio({
 
       {editId ? (
         <div style={{ display: "grid", gap: "14px" }}>
-          <ObjectSelector
+          {step === 1 && <><p className="hint-text">For two doors, add a point on each door. Use “Remove from selection” for shelves or handles you want to keep.</p><ObjectSelector
             editId={editId}
             refFrameIdx={refFrameIdx}
             points={points}
@@ -614,29 +661,42 @@ export default function EditStudio({
             cacheKey={maskRevision}
             imageWidth={width}
             imageHeight={height}
-            busy={busy}
+            busy={operationBusy}
             onAddPoint={handleAddPoint}
             onConfirmTrack={handleTrack}
           />
+          {processing && <p role="status">Updating the selection…</p>}</>}
 
-          {framesData ? (
+          {step === 2 && framesData ? (<>
+            <h3>2. Check the object in other views</h3>
+            <p className="hint-text">The colored overlay is what will change. Correct missing parts, or skip a view only when the object is absent.</p>
+            {coverage && <p role="status" className="coverage-summary">{coverage.masked} of {coverage.total} views masked · {coverage.skipped} skipped · {coverage.missing} need attention</p>}
+            {processing && <p role="status">Tracking the object through the video…</p>}
             <TrackingGrid
               assetBaseUrl={editAssetBaseUrl}
               framesData={framesData}
-              busy={busy}
+              busy={operationBusy}
               cacheKey={maskRevision}
               onPageChange={(page) => runAction(() => loadFrames(editId, page))}
               onToggleSkip={handleToggleSkip}
               onUploadMask={handleUploadMask}
               onSelectFrameForRefine={(frameIdx) => {
                 setRefFrameIdx(frameIdx);
+                setStep(1);
                 setPoints([]);
                 setStatusMessage(`Switched reference canvas to frame #${frameIdx} — click object to refine.`);
               }}
             />
+            <label className="review-confirm"><input type="checkbox" checked={masksReviewed} disabled={operationBusy || !coverage?.ready}
+              onChange={(event) => setReviewedRevision(event.target.checked ? maskRevision : null)} /> I checked the selection in different views</label>
+            <button className="primary-action" disabled={operationBusy || !masksReviewed} onClick={() => setStep(3)}>Continue to color preview</button>
+            {!coverage?.ready && <p className="hint-text">Track all views or mark the remaining views before continuing.</p>}
+          </>
           ) : null}
 
-          <div style={{ display: "grid", gap: "10px", borderTop: "1px solid #334155", paddingTop: "10px" }}>
+          {step === 3 && <div style={{ display: "grid", gap: "10px", borderTop: "1px solid #334155", paddingTop: "10px" }}>
+            <h3>3. Preview the new look</h3>
+            <p className="hint-text">These are previews of one reference image. Apply to all views below to update the 3D room.</p>
             <label style={{ display: "grid", gap: "4px" }}>
               <span>Edit Prompt</span>
               <input
@@ -644,12 +704,12 @@ export default function EditStudio({
                 aria-label="Edit instruction prompt"
                 maxLength={1000}
                 value={prompt}
-                placeholder="e.g. modern emerald velvet armchair"
+                placeholder="e.g. Paint both wardrobe doors blue, keep the handles unchanged"
                 onChange={(e) => setPrompt(e.target.value)}
               />
             </label>
 
-            <label style={{ display: "grid", gap: "4px" }}>
+            <details><summary>Advanced options</summary><label style={{ display: "grid", gap: "4px" }}>
               <span>Negative Prompt (optional)</span>
               <input
                 type="text"
@@ -691,11 +751,12 @@ export default function EditStudio({
                   onChange={(e) => setRebuildMode(e.target.value as RebuildMode)}
                 >
                   <option value="masked_finetune">Masked Fine-Tune (5k steps)</option>
-                  <option value="from_scratch">From Scratch Ablation (15k steps)</option>
+                  <option value="from_scratch">Rebuild entire room (slower)</option>
                 </select>
               </label>
             </div>
 
+            </details>
             {Object.keys(previewSeeds).length > 0 ? (
               <SeedPreviewGallery
                 previewSeeds={previewSeeds}
@@ -708,14 +769,21 @@ export default function EditStudio({
             ) : null}
 
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              <button type="button" disabled={busy} onClick={() => void handlePreviewSeeds()}>
-                Generate Seed Previews
+              <button type="button" className="primary-action" disabled={operationBusy || !masksReviewed || !prompt.trim()} onClick={() => void handlePreviewSeeds()}>
+                Generate color previews
               </button>
               <button type="button" disabled={applyDisabled} onClick={() => void handleApplyRebuild()}>
-                Apply &amp; Rebuild 3D Room
+                Apply to all views &amp; rebuild room
               </button>
             </div>
-          </div>
+          </div>}
+          {step === 4 && <div className="edit-build-status"><h3>4. Build and compare</h3>
+            <p>{blocked ? `Processing is ${project.processing_status}. Use the project controls above to continue.`
+              : editSession?.status === "cancelled" ? "This edit was stopped. Select a different object to start a new edit."
+              : editSession?.status === "failed" ? "This edit could not finish. Open the processing details above for the error."
+              : editSession?.status === "completed" ? "Your edited 3D room is ready. Compare Before and After, then inspect it from several camera angles."
+              : "Applying the look across the video and rebuilding your 3D room. Progress and processing controls are above."}</p>
+          </div>}
         </div>
       ) : null}
     </section>

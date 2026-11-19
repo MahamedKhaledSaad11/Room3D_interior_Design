@@ -27,6 +27,7 @@ from room3d_worker.client import (
 )
 from room3d_worker.common.asset_cache import DiskAssetCache
 from room3d_worker.common.assets import AssetInfo, AssetRevisionError
+from room3d_worker.common.cancellation import TaskInterruptedError, cancellation_scope
 from room3d_worker.common.errors import StageExecutionError
 from room3d_worker.common.manifest import SceneManifest, load_manifest
 from room3d_worker.common.progress import ProgressEvent, progress_sink, relay_subprocess_progress
@@ -292,17 +293,21 @@ class WorkerRunner:
         self._frame_cache_dir = self.work_root / "_warm_frames"
         self._frame_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _start_heartbeat(self, task: TaskClaim) -> tuple[threading.Event, threading.Thread]:
+    def _start_heartbeat(self, task: TaskClaim, cancelled: threading.Event) -> tuple[threading.Event, threading.Thread]:
         stop_event = threading.Event()
         interval = max(0.05, float(self.heartbeat_interval_sec))
 
         def _loop() -> None:
             while not stop_event.wait(interval):
                 try:
-                    self.client.heartbeat(task, self.worker_id)
+                    response = self.client.heartbeat(task, self.worker_id)
+                    if response.get("control_action") in {"pause", "stop"}:
+                        cancelled.set()
+                        break
                 except RetryableWorkerError as exc:
                     logging.getLogger(__name__).warning("Heartbeat will retry: %s", exc)
                 except (StaleAttemptError, WorkerClientError):
+                    cancelled.set()
                     break
 
         thread = threading.Thread(target=_loop, name=f"hb-{task.task_id[:8]}", daemon=True)
@@ -315,32 +320,44 @@ class WorkerRunner:
             return False
         stop_hb: threading.Event | None = None
         hb_thread: threading.Thread | None = None
+        cancelled = threading.Event()
         try:
-            self.client.heartbeat(task, self.worker_id)
-            stop_hb, hb_thread = self._start_heartbeat(task)
+            response = self.client.heartbeat(task, self.worker_id)
+            if response.get("control_action") in {"pause", "stop"}:
+                cancelled.set()
+            stop_hb, hb_thread = self._start_heartbeat(task, cancelled)
             def publish(event: ProgressEvent) -> None:
                 percent = event.percent if event.stage in {"06_diffusion", "07_rebuild"} else event.percent * 0.9
                 self.client.progress(task, event.stage, min(95, percent), event.message, event.telemetry)
 
-            with progress_sink(publish):
+            with cancellation_scope(cancelled), progress_sink(publish):
                 result_payload, manifest_key = self.execute_claim(task)
             stop_hb.set()
             hb_thread.join(timeout=2.0)
             self.client.complete(task, result_payload, result_manifest_key=manifest_key)
-        except StaleAttemptError:
+        except (StaleAttemptError, TaskInterruptedError):
+            self._acknowledge_interruption(task)
             return True
         except Exception as exc:
             logging.getLogger(__name__).exception("Task %s failed", task.task_id)
             try:
                 self.client.fail(task, type(exc).__name__, str(exc), retryable=isinstance(exc, (OSError, RetryableWorkerError)))
             except StaleAttemptError:
-                logging.getLogger(__name__).info("Attempt %s is already closed", task.attempt_id)
+                self._acknowledge_interruption(task)
         finally:
             if stop_hb is not None:
                 stop_hb.set()
             if hb_thread is not None:
                 hb_thread.join(timeout=2.0)
         return True
+
+    def _acknowledge_interruption(self, task: TaskClaim) -> None:
+        try:
+            self.client.interrupted(task)
+        except StaleAttemptError:
+            logging.getLogger(__name__).info("Attempt %s is already closed", task.attempt_id)
+        except WorkerClientError as exc:
+            logging.getLogger(__name__).warning("Could not acknowledge interruption of %s: %s", task.task_id, exc)
 
     def run_forever(self, stop_event: threading.Event | None = None, max_tasks: int | None = None) -> int:
         stop_event = stop_event or threading.Event()

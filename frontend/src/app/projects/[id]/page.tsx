@@ -1,6 +1,8 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import ProjectControls from "@/components/ProjectControls";
 import { useCallback, useEffect, useState } from "react";
 import EditStudio from "@/components/EditStudio";
 import { ProgressPanel } from "@/components/ProgressPanel";
@@ -9,6 +11,7 @@ import { ThemeToggle } from "@/components/ThemeToggle";
 import { API_BASE, roomApi, type Manifest, type ProjectDetail, type TaskSummary, type ViewerController } from "@/lib/api";
 
 export default function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
+  const router = useRouter();
   const [projectId, setProjectId] = useState("");
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [versionManifest, setVersionManifest] = useState<{ versionId: string; data: Manifest } | null>(null);
@@ -69,7 +72,7 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   }, [projectId]);
 
   const activeTask = project?.tasks.find(
-    (t) => t.status === "leased" || t.status === "claimed" || t.status === "running",
+    (t) => ["leased", "claimed", "running", "pausing", "stopping"].includes(t.status),
   ) ?? project?.tasks.find((t) => t.status === "queued");
   const task: TaskSummary | undefined = activeTask ?? project?.tasks[0];
   const hasActiveTasks = Boolean(activeTask);
@@ -120,7 +123,10 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
               />
             </div>
             <aside className="studio-sidebar">
+              {project && <ProjectControls project={project} onRefresh={refresh} onDeleted={() => router.push("/")} />}
               {task ? (
+                <details className="progress-details" open={hasActiveTasks}>
+                  <summary>Processing: {task.status === "completed" ? "finished" : task.status}</summary>
                 <ProgressPanel
                   taskType={task.type}
                   progress={task.progress_pct}
@@ -128,8 +134,8 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
                   status={task.status}
                   message={task.message}
                   telemetry={task.telemetry}
-                  onRetry={() => window.location.reload()}
                 />
+                </details>
               ) : (
                 <ProgressPanel
                   progress={0}

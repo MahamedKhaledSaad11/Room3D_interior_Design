@@ -30,6 +30,7 @@ class Project(Base):
     owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
     name: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="queued")
+    processing_status: Mapped[str] = mapped_column(String(32), default="running", server_default="running")
     active_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     video_relpath: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -123,6 +124,10 @@ def upgrade_existing_schema(target: Any, connection: Connection, **_: Any) -> No
     del target
     inspector = inspect(connection)
     tables = set(inspector.get_table_names())
+    if "projects" in tables:
+        columns = {column["name"] for column in inspector.get_columns("projects")}
+        if "processing_status" not in columns:
+            connection.execute(text("ALTER TABLE projects ADD COLUMN processing_status VARCHAR(32) NOT NULL DEFAULT 'running'"))
     if "edit_sessions" in tables:
         cols = {col["name"] for col in inspector.get_columns("edit_sessions")}
         if "preview_seeds_json" not in cols:

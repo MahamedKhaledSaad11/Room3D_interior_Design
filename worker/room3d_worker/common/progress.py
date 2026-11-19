@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from room3d_worker.common.cancellation import check_cancelled
+
 
 class ProgressEvent(BaseModel):
     stage: str
@@ -21,6 +23,7 @@ _sink: ContextVar[Callable[[ProgressEvent], None] | None] = ContextVar("progress
 
 
 def report_progress(stage: str, percent: float, message: str, **telemetry: float | int | str) -> None:
+    check_cancelled()
     event = ProgressEvent(stage=stage, percent=percent, message=message, telemetry=telemetry)
     destination = os.environ.get("ROOM3D_PROGRESS_FILE")
     if destination:

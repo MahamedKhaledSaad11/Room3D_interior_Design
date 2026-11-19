@@ -30,7 +30,7 @@ class CompleteUpload(BaseModel):
 
 
 def _scope(project_id: str, scope: str, upload_id: UUID, session: Session) -> tuple[StorageDriver, str]:
-    _storage_project(session, project_id, (True, None))
+    _storage_project(session, project_id, (True, None), for_write=True)
     try:
         clean = validate_key(scope)
         if "/" in clean:

@@ -4,11 +4,13 @@ import importlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 
+from room3d_worker.common.cancellation import cancellation_event, check_cancelled
 from room3d_worker.common.errors import StageExecutionError
 
 
@@ -95,7 +97,7 @@ def run_isolated_stage(
     env["QT_QPA_PLATFORM"] = "offscreen"
     started = time.perf_counter()
     try:
-        result = subprocess.run(
+        result = _run_cancellable(cmd, env, timeout_sec) if cancellation_event() is not None else subprocess.run(
             cmd, env=env, check=False, capture_output=True, text=True, timeout=timeout_sec, shell=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -108,6 +110,42 @@ def run_isolated_stage(
         message = _failure_message(f"Stage command exited {result.returncode}: {cmd!r}", result.stderr)
         raise StageExecutionError(message)
     return StageResult(tuple(cmd), result.returncode, elapsed, result.stdout, result.stderr)
+
+
+def _terminate_tree(process: subprocess.Popen[str]) -> None:
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, check=False)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+
+def _run_cancellable(cmd: list[str], env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
+    check_cancelled()
+    started = time.monotonic()
+    process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=os.name != "nt")
+    try:
+        while True:
+            check_cancelled()
+            try:
+                stdout, stderr = process.communicate(timeout=0.25)
+                return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                if time.monotonic() - started >= timeout:
+                    _terminate_tree(process)
+                    stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+    except BaseException:
+        _terminate_tree(process)
+        raise
+    finally:
+        # A killed Python stage may leave COLMAP/CUDA children holding its output pipes.
+        if process.poll() is None:
+            _terminate_tree(process)
+        process.communicate()
 
 
 def run_stage_on_gpu(

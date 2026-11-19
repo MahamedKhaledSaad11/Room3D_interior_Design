@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..models import EditSession, Project, SceneVersion, Task, TaskAttempt
 from .progress import compute_progress
+from .project_control import finish_interruption, lock_project
 from .task_types import canonical_task_type, expand_capabilities
 
 MAX_TASK_RETRIES = 3
@@ -90,6 +91,9 @@ def _preflight_claim(
     task = session.get(Task, task_id)
     if task is None or task.status != "queued":
         return None
+    project = lock_project(session, task.project_id)
+    if project is None or project.processing_status != "running":
+        return None
     payload = _parse_payload(session, task)
     if payload is None:
         return None
@@ -155,14 +159,16 @@ def _as_utc(dt: datetime | None) -> datetime | None:
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def _reclaim_stale_tasks(session: Session, lease_timeout_sec: int | None = None) -> int:
+def _reclaim_stale_tasks(session: Session, lease_timeout_sec: int | None = None, *, project_id: str | None = None) -> int:
     timeout = lease_timeout_sec if lease_timeout_sec is not None else get_settings().task_lease_timeout_sec
     if timeout <= 0:
         return 0
     now = _now()
     cutoff = now - timedelta(seconds=timeout)
     is_pg = bool(session.bind and session.bind.dialect.name != "sqlite")
-    stmt = select(Task).where(Task.status.in_(("claimed", "running")))
+    stmt = select(Task).where(Task.status.in_(("claimed", "running", "pausing", "stopping")))
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
     if is_pg:
         stmt = stmt.with_for_update(skip_locked=True)
     active_tasks = list(session.scalars(stmt).all())
@@ -172,6 +178,10 @@ def _reclaim_stale_tasks(session: Session, lease_timeout_sec: int | None = None)
         attempt = session.get(TaskAttempt, attempt_id) if attempt_id else None
         last_seen = _as_utc(attempt.heartbeat_at if attempt is not None else None) or _as_utc(task.updated_at)
         if last_seen is None or last_seen >= cutoff:
+            continue
+        if task.status in {"pausing", "stopping"}:
+            finish_interruption(session, task)
+            reclaimed += 1
             continue
         requeue = task.retry_count < MAX_TASK_RETRIES
         next_status = "queued" if requeue else "failed"
@@ -233,6 +243,9 @@ def claim_next_task(session: Session, worker_id: str, capabilities: list[str], i
 
 
 def _locked_task(session: Session, task_id: str) -> Task:
+    project_id = session.scalar(select(Task.project_id).where(Task.id == task_id))
+    if project_id is not None:
+        lock_project(session, project_id)
     is_pg = bool(session.bind and session.bind.dialect.name != "sqlite")
     stmt = select(Task).where(Task.id == task_id)
     if is_pg:
@@ -243,8 +256,9 @@ def _locked_task(session: Session, task_id: str) -> Task:
     return task
 
 
-def _check_active_attempt(session: Session, task: Task, attempt_id: str, worker_id: str | None = None) -> TaskAttempt:
-    if task.status not in {"claimed", "running"}:
+def _check_active_attempt(session: Session, task: Task, attempt_id: str, worker_id: str | None = None, *, allow_control: bool = False) -> TaskAttempt:
+    allowed = {"claimed", "running", "pausing", "stopping"} if allow_control else {"claimed", "running"}
+    if task.status not in allowed:
         raise ConflictError("task is no longer active")
     if task.active_attempt_id != attempt_id:
         raise ConflictError("stale task attempt")
@@ -256,12 +270,22 @@ def _check_active_attempt(session: Session, task: Task, attempt_id: str, worker_
     return attempt
 
 
-def heartbeat_task(session: Session, task_id: str, attempt_id: str, worker_id: str) -> None:
+def heartbeat_task(session: Session, task_id: str, attempt_id: str, worker_id: str) -> str | None:
     task = _locked_task(session, task_id)
-    attempt = _check_active_attempt(session, task, attempt_id, worker_id=worker_id)
+    attempt = _check_active_attempt(session, task, attempt_id, worker_id=worker_id, allow_control=True)
     attempt.heartbeat_at = _now()
     if task.status == "claimed":
         task.status = "running"
+    session.commit()
+    return {"pausing": "pause", "stopping": "stop"}.get(task.status)
+
+
+def acknowledge_interruption(session: Session, task_id: str, attempt_id: str, worker_id: str) -> None:
+    task = _locked_task(session, task_id)
+    _check_active_attempt(session, task, attempt_id, worker_id=worker_id, allow_control=True)
+    if task.status not in {"pausing", "stopping"}:
+        raise ConflictError("No processing interruption was requested")
+    finish_interruption(session, task)
     session.commit()
 
 

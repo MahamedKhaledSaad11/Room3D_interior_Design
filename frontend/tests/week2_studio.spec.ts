@@ -41,6 +41,7 @@ test("live edit masks, manual fallback, four seeds, and rebuilt Before / After",
     } });
     if (path.endsWith("/frames")) return route.fulfill({ json: {
       edit_id: "edit", page: 1, page_size: 24, total: 2,
+      coverage: { total: 2, masked: tracked ? (skipped ? 1 : 2) : 1, skipped: skipped ? 1 : 0, missing: tracked ? 0 : 1, ready: tracked },
       frames: frames.map((frame) => ({ ...frame, mask_status: "auto", skip_frame: frame.frame_idx === 1 && skipped,
         mask_key: tracked || frame.frame_idx === 0 ? `live/edits/edit/masks/${String(frame.frame_idx).padStart(6, "0")}.png` : null })),
     } });
@@ -68,28 +69,31 @@ test("live edit masks, manual fallback, four seeds, and rebuilt Before / After",
   });
 
   await page.goto("/projects/live");
-  await page.getByRole("button", { name: "2D Frame Picker", exact: true }).click();
   await page.getByTestId("frame-picker-canvas").click();
   await expect(page.getByTestId("mask-overlay")).toBeVisible();
   await expect.poll(() => page.getByTestId("mask-overlay").evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(64);
-  await page.getByRole("button", { name: "Confirm Mask & Track Across Frames" }).click();
+  await page.getByRole("button", { name: "Track this object in all views" }).click();
   await expect(page.getByTestId("mask-thumb-1")).toBeVisible();
   await page.getByRole("button", { name: "Mark object in frame 1" }).click();
   await page.getByTestId("ref-frame-canvas").press("Enter");
   await expect.poll(() => refinedFrame).toBe(1);
+  await page.getByRole("button", { name: /Review views/ }).click();
   const frame = page.locator("article").filter({ hasText: "Frame #1" });
   await frame.getByRole("button", { name: "Skip Frame", exact: true }).click();
   await expect(frame.getByRole("button", { name: "Include Frame" })).toBeVisible();
   await frame.getByRole("button", { name: "Include Frame" }).click();
   await page.getByLabel("Upload PNG mask for frame 1").setInputFiles("tests/fixtures/mask.png");
   await expect.poll(() => manualUploads).toBe(1);
+  await page.screenshot({ path: "../.local_data/edit-studio-review.png", fullPage: true });
+  await page.getByRole("checkbox", { name: "I checked the selection in different views" }).check();
+  await page.getByRole("button", { name: "Continue to color preview" }).click();
   await page.getByLabel("Edit instruction prompt").fill("emerald velvet chair");
-  await page.getByRole("button", { name: "Generate Seed Previews" }).click();
+  await page.getByRole("button", { name: "Generate color previews" }).click();
   for (const seed of [101, 202, 303, 404]) {
     await expect.poll(() => page.getByTestId(`seed-preview-img-${seed}`).evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(64);
   }
-  await page.getByRole("button", { name: "Select seed 202", exact: true }).click();
-  await page.getByRole("button", { name: "Apply & Rebuild 3D Room" }).click();
+  await page.getByRole("button", { name: "Choose look 2", exact: true }).click();
+  await page.getByRole("button", { name: "Apply to all views & rebuild room" }).click();
   await expect.poll(() => chosenSeed).toBe("202");
   await expect(page.locator(".viewer3d")).toHaveAttribute("data-version-id", "v2");
   await page.getByRole("button", { name: "Before", exact: true }).click();
@@ -97,4 +101,48 @@ test("live edit masks, manual fallback, four seeds, and rebuilt Before / After",
   await page.getByRole("button", { name: "After", exact: true }).click();
   await expect(page.locator(".viewer3d")).toHaveAttribute("data-version-id", "v2");
   expect(errors).toEqual([]);
+});
+
+test("project controls pause, resume, stop, and confirm permanent deletion", async ({ page }) => {
+  let processing = "running";
+  let taskStatus = "running";
+  let pendingReads = 0;
+  let removed = false;
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/processing")) {
+      const action = route.request().postDataJSON().action;
+      processing = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
+      taskStatus = action === "pause" ? "pausing" : action === "stop" ? "cancelled" : "running";
+      return route.fulfill({ json: {} });
+    }
+    if (path === "/api/projects/controls") {
+      if (route.request().method() === "DELETE") {
+        removed = true;
+        return route.fulfill({ json: { deleted: true } });
+      }
+      if (taskStatus === "pausing" && ++pendingReads > 1) taskStatus = "paused";
+      return route.fulfill({ json: {
+        id: "controls", name: "Controls test", status: "running", processing_status: processing,
+        active_version_id: null, created_at: "2026-11-19", versions: [], edit_sessions: [],
+        tasks: [{ id: "task", type: "diffusion_apply", stage: "06_diffusion", status: taskStatus, progress_pct: 50 }],
+      } });
+    }
+    return route.fulfill({ json: [] });
+  });
+  await page.goto("/projects/controls");
+  await page.getByRole("button", { name: "Pause processing", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Resume processing" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Resume processing" })).toBeEnabled();
+  await page.getByRole("button", { name: "Resume processing" }).click();
+  await expect(page.getByRole("button", { name: "Pause processing", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Stop processing", exact: true }).click();
+  await page.getByRole("button", { name: "Stop current work" }).click();
+  await expect(page.getByRole("button", { name: "Enable new edits" })).toBeEnabled();
+  await page.getByRole("button", { name: "Delete project", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Delete project permanently" })).toBeVisible();
+  expect(removed).toBe(false);
+  await page.getByRole("button", { name: "Permanently delete project" }).click();
+  await expect(page).toHaveURL(/\/$/);
+  expect(removed).toBe(true);
 });

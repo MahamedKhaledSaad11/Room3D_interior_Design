@@ -19,7 +19,7 @@ os.environ["ROOM3D_RUN_DAEMON"] = "1"
 
 Use the same worker secret on both machines. Restart the backend after changing its environment.
 The notebook's existing `BACKEND_URL` default is overridden by `ROOM3D_BACKEND_URL`.
-Cells 4–11 are the standalone lab; they do not have to run before the live daemon.
+Cells 4â€“11 are the standalone lab; they do not have to run before the live daemon.
 The daemon does not automatically import an earlier standalone lab scene. Upload a video through
 the frontend or use `scripts/import_kaggle_bundle.py` to register an existing bundle first.
 
@@ -87,6 +87,32 @@ the stored mask overlays. Use **Mark Object**, **Skip/Include Frame**, or **Uplo
 correct tracking. Generate four seed previews, select one, then apply the edit. Completion loads
 the rebuilt version in `Viewer3D` (the repository's splat viewer) and exposes **Before / After**.
 
+The studio now guides editing through **Select object â†’ Review views â†’ Preview look â†’ Build room**.
+Video-frame selection is the default. Add foreground points on every part of the object (for
+example, on both wardrobe doors), then confirm the mask and track through the video. Review the
+mask overlays from multiple angles. A view needs a mask or an explicit skip when the object is
+absent. Counts cover the entire video, including pages not currently displayed. The server rejects
+an apply with unreviewed frames; generating a reference-image preview alone cannot update a room.
+Confirm the view review, generate previews, choose a look, and use **Apply to all views & rebuild
+room**. Completed processing is separate from visual quality: inspect the rebuilt room from
+several angles before accepting it. Previous edits can be reopened without starting a new session.
+
+**Project controls** provide Pause, Resume, Stop, and permanent deletion. Pause holds queued work
+and requests termination of the active stage through the worker heartbeat. The UI shows a pending
+state until the worker acknowledges; allow up to its heartbeat interval plus an in-flight network
+request or in-process operation. Resume restarts the interrupted task, preserving completed tasks; it does not resume a
+GPU optimizer at the exact interrupted iteration. Stop cancels remaining tasks and preserves
+completed room versions. Enable new edits to work on a stopped project again.
+
+Deletion requires a separate confirmation and waits for active workers to acknowledge stopping.
+It removes project-scoped storage (video, versions, edits, upload parts) and database task attempts,
+tasks, edits, versions, and the project. Ownership checks apply to all controls. Late progress or
+completion from an interrupted attempt is rejected. A worker that disappears is handled by the
+existing lease timeout before deletion can proceed. From the `backend/` directory, run
+`alembic upgrade head` for managed databases; local startup also adds the processing-status column
+to existing databases.
+Deploy backend, frontend, and worker together, then restart the Kaggle daemon.
+
 Asset transport now uses these routes (repeat `?paths=images&paths=depths` to select components):
 
 - `GET /api/storage/{project_id}/{version_id}/bundle-index` and `bundle.zip`.
@@ -116,7 +142,7 @@ files and older single-file URLs remain available. If both names exist, the cano
 asset takes precedence. The lossless transport changes do not alter optimizer iterations,
 diffusion settings, image pixels, or checkpoint parameters.
 
-Diffusion and rebuild report live 10–95% processing progress, then 95–99% bundle transfer progress;
+Diffusion and rebuild report live 10â€“95% processing progress, then 95â€“99% bundle transfer progress;
 completion reaches 100%. The subprocess relay coalesces queued events rather than replaying a
 long HTTP backlog after GPU work finishes. Edit Studio uses task percentages and stable mask
 revision URLs, and review thumbnails load lazily.

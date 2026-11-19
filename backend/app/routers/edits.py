@@ -24,13 +24,14 @@ from ..schemas import (
     EditSessionOut,
     MaskUpdateResponse,
     PreviewSeedsRequest,
-    PromptPoint,
     RefineRequest,
     ResolveClickRequest,
     TaskViewResponse,
 )
 from ..security import get_current_user
 from ..services.celery_bridge import dispatch_task_if_configured
+from ..services.edit_coverage import mask_coverage
+from ..services.project_control import lock_project
 from ..services.queue import invalidate_edit_previews, masks_digest
 from ..storage import get_storage
 from .projects import _project
@@ -175,6 +176,9 @@ def _task_view(task: Task) -> TaskViewResponse:
 
 
 def _queue_edit_task(session: Session, edit: EditSession, task_type: str, payload: dict[str, Any]) -> Task:
+    project = lock_project(session, edit.project_id)
+    if project is None or project.processing_status != "running":
+        raise HTTPException(409, "Resume project processing before starting or changing an edit")
     task = Task(
         project_id=edit.project_id,
         edit_session_id=edit.id,
@@ -385,7 +389,9 @@ def list_edit_frames(
                 skip_frame=bool(entry.get("skip_frame", False)),
             )
         )
-    return EditFramesResponse(edit_id=edit.id, page=page, page_size=page_size, total=len(frames_meta), frames=items)
+    coverage = mask_coverage([int(frame["frame_idx"]) for frame in frames_meta if not frame.get("excluded")], summary)
+    return EditFramesResponse(edit_id=edit.id, page=page, page_size=page_size, total=len(frames_meta), frames=items,
+                              coverage=coverage)
 
 
 def _apply_skip_flag(session: Session, edit: EditSession, frame_idx: int, payload: Any) -> MaskUpdateResponse:
@@ -512,7 +518,7 @@ def apply_edit(
         select(Task).where(
             Task.edit_session_id == edit.id,
             Task.task_type == "rebuild_week2",
-            Task.status.in_(("queued", "claimed", "running")),
+            Task.status.in_(("queued", "claimed", "running", "paused", "pausing", "stopping")),
         )
     )
     if active_task is not None:
@@ -550,13 +556,19 @@ def apply_edit(
     effective_negative_prompt = (
         body.negative_prompt if body.negative_prompt is not None else meta.get("negative_prompt")
     )
-    version, _ = _load_version_manifest(project, edit.base_version_id, session)
+    version, manifest = _load_version_manifest(project, edit.base_version_id, session)
     base_version_id = edit.base_version_id or (version.id if version else None)
     target_version_id = edit.target_version_id or str(uuid.uuid4())
     colliding = session.get(SceneVersion, target_version_id)
-    if colliding is not None and colliding.project_id != project.id:
+    if colliding is not None:
         target_version_id = str(uuid.uuid4())
     masks_summary: dict[str, Any] = json.loads(edit.masks_summary_json or "{}")
+    frame_ids = [int(frame["frame_idx"]) for frame in (manifest or {}).get("frames", []) if not frame.get("excluded")]
+    coverage = mask_coverage(frame_ids, masks_summary)
+    if not coverage.ready:
+        raise HTTPException(422, f"Track and review all views before applying: {coverage.masked} masked, "
+                            f"{coverage.skipped} skipped, {coverage.missing} unreviewed. "
+                            "Mark missing objects or explicitly skip views where the object is absent.")
     exclude_frames = sorted(
         int(k) for k, v in masks_summary.items() if isinstance(v, dict) and bool(v.get("skip_frame"))
     )

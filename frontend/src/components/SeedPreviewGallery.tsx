@@ -34,7 +34,7 @@ export default function SeedPreviewGallery({
   return (
     <section aria-label="Seed Preview Gallery" style={{ display: "grid", gap: "8px", opacity: stale ? 0.55 : 1 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-        <strong>Seed Previews ({entries.length})</strong>
+        <strong>Choose a look ({entries.length})</strong>
         <button type="button" aria-pressed={showOriginal} onClick={() => setShowOriginal((v) => !v)}>
           {showOriginal ? "Showing Original" : "Compare with Original"}
         </button>
@@ -45,7 +45,7 @@ export default function SeedPreviewGallery({
         </p>
       ) : null}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "8px" }}>
-        {entries.map(([seed, key]) => {
+        {entries.map(([seed, key], index) => {
           const selected = seed === selectedSeed;
           const src = showOriginal && referenceImageUrl ? referenceImageUrl : previewUrlWithVersion(key, cacheKey);
           return (
@@ -53,12 +53,12 @@ export default function SeedPreviewGallery({
               key={seed}
               type="button"
               aria-pressed={selected}
-              aria-label={`Select seed ${seed}`}
+              aria-label={`Choose look ${index + 1}`}
               onClick={() => onSelectSeed(seed)}
               style={{ padding: "4px", display: "grid", gap: "4px", borderColor: selected ? "#2dd4bf" : undefined, borderWidth: selected ? 2 : 1 }}
             >
               <img src={src} alt={`Preview for ${seed}`} data-testid={`seed-preview-img-${seed}`} style={thumbStyle} />
-              <span style={{ fontSize: "11px" }}>{seed}</span>
+              <span style={{ fontSize: "11px" }}>Look {index + 1}{selected ? " · Selected" : ""}</span>
             </button>
           );
         })}

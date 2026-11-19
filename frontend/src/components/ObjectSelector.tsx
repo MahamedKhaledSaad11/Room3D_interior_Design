@@ -29,7 +29,6 @@ export function maskOverlayUrl(maskKey: string, version: number | string): strin
 }
 
 export default function ObjectSelector({
-  editId,
   refFrameIdx,
   points,
   imageUrl,
@@ -56,13 +55,13 @@ export default function ObjectSelector({
   return (
     <section aria-label="Object Mask Selector" style={{ display: "grid", gap: "10px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-        <strong>Ref Frame #{refFrameIdx} ({editId.slice(0, 8)})</strong>
+        <strong>Selected frame #{refFrameIdx}</strong>
         <div style={{ display: "flex", gap: "6px" }}>
           <button type="button" aria-pressed={label === 1} onClick={() => setLabel(1)} style={{ borderColor: label === 1 ? "#2dd4bf" : undefined }}>
-            + Foreground
+            Add to selection
           </button>
           <button type="button" aria-pressed={label === 0} onClick={() => setLabel(0)} style={{ borderColor: label === 0 ? "#fb7185" : undefined }}>
-            - Background
+            Remove from selection
           </button>
           {maskKey ? (
             <button type="button" aria-pressed={showMask} onClick={() => setShowMask((v) => !v)}>
@@ -127,7 +126,7 @@ export default function ObjectSelector({
       </div>
 
       <button type="button" disabled={busy} onClick={() => void onConfirmTrack()}>
-        Confirm Mask &amp; Track Across Frames
+        Track this object in all views
       </button>
     </section>
   );

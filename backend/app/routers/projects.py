@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..db import get_db
-from ..models import EditSession, Project, SceneVersion, Task
+from ..models import EditSession, Project, SceneVersion, Task, TaskAttempt
 from ..security import get_current_user
 from ..services.celery_bridge import dispatch_task_if_configured
+from ..services.project_control import control_project, lock_project
+from ..services.queue import _reclaim_stale_tasks
 from ..storage import get_storage
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -22,6 +24,10 @@ _EXTENSIONS = {".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/w
 
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+
+
+class ProjectControl(BaseModel):
+    action: Literal["pause", "resume", "stop"]
 
 
 class BoundedStream:
@@ -46,6 +52,7 @@ def _project(session: Session, project_id: str, user_id: str | None) -> Project:
 
 def _view(project: Project) -> dict[str, object]:
     return {"id": project.id, "name": project.name, "status": project.status,
+            "processing_status": project.processing_status,
             "active_version_id": project.active_version_id, "created_at": project.created_at}
 
 
@@ -87,6 +94,7 @@ def create_project(body: ProjectCreate, session: Session = Depends(get_db), user
 @router.get("/{project_id}")
 def get_project(project_id: str, session: Session = Depends(get_db), user_id: str | None = Depends(get_current_user)) -> dict[str, object]:
     project = _project(session, project_id, user_id)
+    _reclaim_stale_tasks(session, project_id=project.id)
     versions = session.scalars(select(SceneVersion).where(SceneVersion.project_id == project.id)).all()
     tasks = session.scalars(select(Task).where(Task.project_id == project.id).order_by(Task.created_at.desc())).all()
     edits = session.scalars(select(EditSession).where(EditSession.project_id == project.id).order_by(EditSession.created_at.desc())).all()
@@ -128,6 +136,8 @@ def upload_project(
     user_id: str | None = Depends(get_current_user),
 ) -> dict[str, object]:
     project = _project(session, project_id, user_id)
+    if project.processing_status != "running":
+        raise HTTPException(409, "Resume project processing before uploading a video")
     filename = file.filename or "upload"
     suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if suffix not in _EXTENSIONS or (file.content_type and file.content_type != _EXTENSIONS[suffix]):
@@ -166,3 +176,40 @@ def upload_project(
     session.commit()
     dispatch_task_if_configured(task.id, task.task_type, settings, payload)
     return {"project_id": project.id, "video_key": key, "version_id": version_id, "bytes": written, "task_id": task.id}
+
+
+@router.post("/{project_id}/processing")
+def update_processing(
+    project_id: str, body: ProjectControl, session: Session = Depends(get_db),
+    user_id: str | None = Depends(get_current_user),
+) -> dict[str, object]:
+    project = _project(session, project_id, user_id)
+    try:
+        control_project(session, project, body.action)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return _view(project)
+
+
+@router.delete("/{project_id}")
+def delete_project(
+    project_id: str, session: Session = Depends(get_db),
+    user_id: str | None = Depends(get_current_user),
+) -> dict[str, bool]:
+    project = _project(session, project_id, user_id)
+    lock_project(session, project.id)
+    _reclaim_stale_tasks(session, project_id=project.id)
+    project.processing_status = "deleting"
+    session.flush()
+    active = session.scalar(select(Task.id).where(Task.project_id == project.id,
+                            Task.status.in_(("claimed", "running", "pausing", "stopping"))))
+    if active:
+        raise HTTPException(409, "Stop processing and wait for the worker to acknowledge before deleting.")
+    get_storage(get_settings()).delete_prefix(project.id)
+    task_ids = select(Task.id).where(Task.project_id == project.id)
+    session.execute(delete(TaskAttempt).where(TaskAttempt.task_id.in_(task_ids)))
+    for model in (Task, EditSession, SceneVersion):
+        session.execute(delete(model).where(model.project_id == project.id))
+    session.delete(project)
+    session.commit()
+    return {"deleted": True}

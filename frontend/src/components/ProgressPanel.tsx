@@ -32,7 +32,11 @@ const formatRuntime = (seconds?: number): string =>
 export function ProgressPanel({ progress, stage, status, message, telemetry, onRetry, taskType }: ProgressPanelProps) {
   const failed = status === "failed";
   const done = status === "completed";
+  const controlHeadings: Readonly<Record<string, string>> = { paused: "Processing paused", pausing: "Pausing processing…", stopping: "Stopping processing…", cancelled: "Processing stopped" };
+  const controlHeading = controlHeadings[status];
   const isWeek2 = stage?.startsWith("05_") || stage?.startsWith("06_") || stage?.startsWith("07_");
+  const doneHeading = !isWeek2 || stage === "07_rebuild" ? "Room ready"
+    : taskType === "diffusion_preview" ? "Previews ready" : stage === "05_track" ? "Selection ready" : "Edited views ready";
   const ownStage = isWeek2 && taskType ? WEEK2_STAGES.find((item) => item.id === stage) : undefined;
   const activeStages = ownStage ? [{ ...ownStage, threshold: 100 }] : isWeek2 ? WEEK2_STAGES : WEEK1_STAGES;
   const heading = ownStage?.id === "06_diffusion" ? "Editing your object" : ownStage?.id === "07_rebuild" ? "Rebuilding edited scene" : "Building your room";
@@ -42,7 +46,7 @@ export function ProgressPanel({ progress, stage, status, message, telemetry, onR
       <div className="panel-heading">
         <div>
           <p className="eyebrow">{isWeek2 ? "OBJECT EDIT" : "ROOM BUILD"}</p>
-          <h2>{failed ? "Build needs attention" : done ? "Room ready" : heading}</h2>
+          <h2>{controlHeading ?? (failed ? "Build needs attention" : done ? doneHeading : heading)}</h2>
         </div>
         <strong>{Math.round(progress)}%</strong>
       </div>

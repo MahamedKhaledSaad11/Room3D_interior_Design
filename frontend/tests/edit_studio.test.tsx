@@ -57,6 +57,7 @@ describe("EditStudio interactive Week 2 workflow", () => {
       page: 1,
       page_size: 24,
       total: 2,
+      coverage: { total: 2, masked: 2, skipped: 0, missing: 0, ready: true },
       frames: [
         { frame_idx: 0, image_relpath: "images/frame_000000.jpg", mask_key: null, mask_status: "auto", skip_frame: false },
         { frame_idx: 2, image_relpath: "images/frame_000002.jpg", mask_key: null, mask_status: "auto", skip_frame: false },
@@ -103,7 +104,7 @@ describe("EditStudio interactive Week 2 workflow", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /Edit Object Mode: OFF/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Select in 3D" }));
     expect(clickCallback).not.toBeNull();
     await act(async () => {
       clickCallback?.({
@@ -116,37 +117,43 @@ describe("EditStudio interactive Week 2 workflow", () => {
       });
     });
 
-    await waitFor(() => expect(screen.getByText(/Ref Frame #2/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Selected frame #2/i)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("button", { name: "- Background" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove from selection" }));
     fireEvent.keyDown(screen.getByTestId("ref-frame-canvas"), { key: "Enter" });
     await waitFor(() => expect(refineSpy).toHaveBeenCalledWith("edit-1234", [{ x: 320, y: 240, label: 0 }]));
 
-    fireEvent.click(screen.getByRole("button", { name: /Confirm Mask & Track Across Frames/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Track this object in all views/i })).toBeEnabled(), { timeout: 4000 });
+    fireEvent.click(screen.getByRole("button", { name: /Track this object in all views/i }));
     await waitFor(() => expect(trackSpy).toHaveBeenCalledWith("edit-1234"));
 
     const skipButtons = screen.getAllByRole("button", { name: "Skip Frame" });
     expect(skipButtons[0]).toBeDefined();
+    await waitFor(() => expect(skipButtons[0]).toBeEnabled(), { timeout: 4000 });
     fireEvent.click(skipButtons[0] as HTMLElement);
     await waitFor(() => expect(updateMaskSpy).toHaveBeenCalledWith("edit-1234", 0, { skip_frame: true }));
 
     const fileInput = screen.getByLabelText("Upload PNG mask for frame 2");
+    await waitFor(() => expect(fileInput).toBeEnabled());
     const pngFile = new File([new Uint8Array([137, 80, 78, 71])], "mask.png", { type: "image/png" });
     fireEvent.change(fileInput, { target: { files: [pngFile] } });
     await waitFor(() => expect(updateMaskSpy).toHaveBeenCalledTimes(2));
 
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: /I checked the selection/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("checkbox", { name: /I checked the selection/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue to color preview" }));
     fireEvent.change(screen.getByLabelText("Edit instruction prompt"), { target: { value: "emerald armchair" } });
-    fireEvent.click(screen.getByRole("button", { name: "Generate Seed Previews" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate color previews" }));
     await waitFor(() => expect(previewSpy).toHaveBeenCalledWith("edit-1234", "emerald armchair", [101, 202, 303, 404], "flux2_klein_4b", undefined));
     await waitFor(() => expect(screen.getAllByRole("img", { name: /Preview for/ })).toHaveLength(4));
-    fireEvent.click(screen.getByRole("button", { name: "Select seed 202" }));
+    fireEvent.click(screen.getByRole("button", { name: "Choose look 2" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Apply & Rebuild 3D Room" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply to all views & rebuild room" }));
     await waitFor(() => expect(applySpy).toHaveBeenCalledWith("edit-1234", "202", "masked_finetune", "emerald armchair"));
-    await waitFor(() => expect(screen.getByText(/Rebuild queued for version v2/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/Applying your edit across all views/i)).toBeInTheDocument());
     expect(onRefreshProject).toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "V2 Velvet Chair" }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Room version" }), { target: { value: "v2" } });
     expect(onSelectVersion).toHaveBeenCalledWith("v2");
     expect(controller.setActiveVersion).toHaveBeenCalledWith("v2");
     latest = { ...latest, status: "completed" };

@@ -22,6 +22,7 @@ from room3d_worker.common.assets import (
     asset_revision,
     safe_asset_path,
 )
+from room3d_worker.common.cancellation import check_cancelled
 from room3d_worker.common.subprocess_runner import StageResult, run_stage_on_gpu
 
 
@@ -114,6 +115,7 @@ class WorkerClient:
         self.close()
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        check_cancelled()
         try:
             response = self._http.request(method, path, **kwargs)
         except httpx.TransportError as exc:
@@ -157,6 +159,11 @@ class WorkerClient:
     def heartbeat(self, task: TaskClaim, worker_id: str | None = None) -> dict[str, Any]:
         payload = {"attempt_id": task.attempt_id, "worker_id": worker_id or task.worker_id or ""}
         return self._retry_post(f"/api/tasks/{task.task_id}/heartbeat", body=payload, timeout=30.0)
+
+    def interrupted(self, task: TaskClaim) -> dict[str, Any]:
+        return self._request("POST", f"/api/tasks/{task.task_id}/interrupted", json={
+            "attempt_id": task.attempt_id, "worker_id": task.worker_id or "",
+        })
 
     def progress(
         self,

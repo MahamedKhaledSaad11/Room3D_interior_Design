@@ -8,7 +8,15 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..security import require_worker_token
-from ..services.queue import ConflictError, claim_next_task, complete_task, fail_task, heartbeat_task, update_progress
+from ..services.queue import (
+    ConflictError,
+    acknowledge_interruption,
+    claim_next_task,
+    complete_task,
+    fail_task,
+    heartbeat_task,
+    update_progress,
+)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"], dependencies=[Depends(require_worker_token)])
 
@@ -59,9 +67,18 @@ def claim(body: ClaimRequest, session: Session = Depends(get_db)) -> dict[str, A
 
 
 @router.post("/{task_id}/heartbeat")
-def heartbeat(task_id: str, body: HeartbeatRequest, session: Session = Depends(get_db)) -> dict[str, bool]:
+def heartbeat(task_id: str, body: HeartbeatRequest, session: Session = Depends(get_db)) -> dict[str, object]:
     try:
-        heartbeat_task(session, task_id, body.attempt_id, body.worker_id or "")
+        action = heartbeat_task(session, task_id, body.attempt_id, body.worker_id)
+    except ConflictError as exc:
+        raise _conflict(exc) from exc
+    return {"ok": True, "control_action": action}
+
+
+@router.post("/{task_id}/interrupted")
+def interrupted(task_id: str, body: HeartbeatRequest, session: Session = Depends(get_db)) -> dict[str, bool]:
+    try:
+        acknowledge_interruption(session, task_id, body.attempt_id, body.worker_id)
     except ConflictError as exc:
         raise _conflict(exc) from exc
     return {"ok": True}

@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .services.edit_coverage import EditCoverage
+
 
 class ResolveClickRequest(BaseModel):
     screenX: float = 0.0
@@ -109,6 +111,7 @@ class EditFramesResponse(BaseModel):
     page_size: int
     total: int
     frames: list[EditFrameItem]
+    coverage: EditCoverage | None = None
 
 
 class MaskUpdateResponse(BaseModel):

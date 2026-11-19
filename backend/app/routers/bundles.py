@@ -100,7 +100,7 @@ def download_bundle(
 def upload_bundle(
     project_id: str, scope: str, file: UploadFile, session: SessionDep, edit_id: str | None = None,
 ) -> dict[str, object]:
-    _storage_project(session, project_id, (True, None))
+    _storage_project(session, project_id, (True, None), for_write=True)
     try:
         storage = get_storage(get_settings())
         prefix = _prefix(project_id, scope, edit_id)

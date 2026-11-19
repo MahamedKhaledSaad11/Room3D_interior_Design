@@ -103,6 +103,74 @@ def _png_bytes(width: int, height: int, mode: str = "L", color: int | tuple[int,
     return buf.getvalue()
 
 
+def test_project_pause_resume_stop_and_delete_are_fenced(isolated_client: TestClient) -> None:
+    client = isolated_client
+    owner = _auth(client, "owner@test.dev", "pw-owner-123")
+    other = _auth(client, "other@test.dev", "pw-other-123")
+    worker = {"X-Worker-Token": "test-worker-secret"}
+    root = "/api/projects/proj-s21"
+    assert client.delete(root, headers=other).status_code == 404
+    assert client.post(root + "/processing", json={"action": "pause"}, headers=other).status_code == 404
+    edit = client.post(root + "/edits/resolve-click", json={"frame_idx": 0}, headers=owner).json()
+    claim = client.post("/api/tasks/claim", json={"worker_id": "control-worker"}, headers=worker).json()
+    from app.db import SessionLocal
+    from app.models import Task
+    with SessionLocal() as session:
+        session.add(Task(project_id="proj-s21", edit_session_id=edit["edit_id"], task_type="rebuild_week2",
+                         payload_json=json.dumps({"depends_on_task_id": claim["task_id"]})))
+        session.commit()
+    task_root = f"/api/tasks/{claim['task_id']}"
+    body = {"attempt_id": claim["attempt_id"], "worker_id": "control-worker"}
+    assert client.post(root + "/processing", json={"action": "pause"}, headers=owner).status_code == 200
+    assert {task["status"] for task in client.get(root, headers=owner).json()["tasks"]} == {"pausing", "paused"}
+    assert client.post("/api/storage/proj-s21/v1/upload", files={"file": ("late.png", b"late")}, headers=worker).status_code == 409
+    assert client.post(task_root + "/heartbeat", json=body, headers=worker).json()["control_action"] == "pause"
+    assert client.post(task_root + "/complete", json=body, headers=worker).status_code == 409
+    assert client.post(root + "/processing", json={"action": "resume"}, headers=owner).status_code == 409
+    assert client.delete(root, headers=owner).status_code == 409
+    assert client.post(task_root + "/interrupted", json={**body, "worker_id": "intruder"}, headers=worker).status_code == 409
+    assert client.post(task_root + "/interrupted", json=body, headers=worker).status_code == 200
+    assert client.post("/api/tasks/claim", json={"worker_id": "control-worker"}, headers=worker).status_code == 204
+    assert client.post(root + "/processing", json={"action": "resume"}, headers=owner).status_code == 200
+    resumed = client.post("/api/tasks/claim", json={"worker_id": "control-worker"}, headers=worker).json()
+    assert resumed["task_id"] == claim["task_id"] and resumed["attempt_id"] != claim["attempt_id"]
+    assert client.post(task_root + "/complete", json=body, headers=worker).status_code == 409
+    assert client.post(root + "/processing", json={"action": "stop"}, headers=owner).status_code == 200
+    new_body = {**body, "attempt_id": resumed["attempt_id"]}
+    assert client.post(task_root + "/heartbeat", json=new_body, headers=worker).json()["control_action"] == "stop"
+    assert client.post(task_root + "/interrupted", json=new_body, headers=worker).status_code == 200
+    assert all(task["status"] == "cancelled" for task in client.get(root, headers=owner).json()["tasks"])
+    assert client.get(f"/api/edits/{edit['edit_id']}", headers=owner).json()["status"] == "cancelled"
+    from app.config import get_settings
+    from app.storage import get_storage
+    storage = get_storage(get_settings())
+    storage.put_stream("proj-s21/edits/cache/mask.png", BytesIO(b"mask"))
+    assert client.delete(root, headers=owner).status_code == 200
+    assert not storage.exists("proj-s21/v1/manifest.json")
+    assert not storage.exists("proj-s21/edits/cache/mask.png")
+    assert client.get(root, headers=owner).status_code == 404
+    assert client.post("/api/storage/proj-s21/v1/upload", files={"file": ("late.png", b"late")}, headers=worker).status_code == 404
+    assert client.post(task_root + "/complete", json=new_body, headers=worker).status_code == 404
+
+
+def test_single_reference_preview_cannot_be_applied_as_a_room(isolated_client: TestClient) -> None:
+    client = isolated_client
+    owner = _auth(client, "owner@test.dev", "pw-owner-123")
+    worker = {"X-Worker-Token": "test-worker-secret"}
+    edit_id = client.post("/api/projects/proj-s21/edits/resolve-click", json={"frame_idx": 0}, headers=owner).json()["edit_id"]
+    claim = client.post("/api/tasks/claim", json={"worker_id": "w1"}, headers=worker).json()
+    client.post(f"/api/tasks/{claim['task_id']}/complete", headers=worker, json={"attempt_id": claim["attempt_id"],
+                "result_payload": {"mask_key": f"proj-s21/edits/{edit_id}/masks/000000.png"}})
+    client.post(f"/api/edits/{edit_id}/preview-seeds", headers=owner, json={"prompt": "both doors blue", "seeds": [101]})
+    claim = client.post("/api/tasks/claim", json={"worker_id": "w1"}, headers=worker).json()
+    client.post(f"/api/tasks/{claim['task_id']}/complete", headers=worker, json={"attempt_id": claim["attempt_id"],
+                "result_payload": {"preview_seeds": {"101": "proj-s21/preview.png"}}})
+    coverage = client.get(f"/api/edits/{edit_id}/frames?page_size=1", headers=owner).json()["coverage"]
+    assert coverage == {"total": 2, "masked": 1, "skipped": 0, "missing": 1, "ready": False}
+    result = client.post(f"/api/edits/{edit_id}/apply", headers=owner, json={"chosen_seed_id": "101"})
+    assert result.status_code == 422 and "1 unreviewed" in result.json()["detail"]
+
+
 def test_edit_ownership_isolation_and_strict_mask_validation(isolated_client: TestClient) -> None:
     owner_h = _auth(isolated_client, "owner@test.dev", "pw-owner-123")
     other_h = _auth(isolated_client, "other@test.dev", "pw-other-123")
@@ -162,8 +230,22 @@ def test_apply_barrier_completion_failure_cascade_and_idempotency(isolated_clien
         headers=worker_h,
     )
 
+    # Every view must be masked or explicitly skipped before a 3D apply.
+    isolated_client.put(f"/api/edits/{edit_id}/masks/0", files={"file": ("mask.png", _png_bytes(160, 128), "image/png")}, headers=owner_h)
+    isolated_client.put(f"/api/edits/{edit_id}/masks/1", json={"skip_frame": True}, headers=owner_h)
+    isolated_client.post(f"/api/edits/{edit_id}/preview-seeds", json={"prompt": "blue velvet sofa", "seeds": [11, 22]}, headers=owner_h)
+    fresh = isolated_client.post("/api/tasks/claim", json={"worker_id": "w1", "capabilities": ["diffusion_preview"]}, headers=worker_h).json()
+    isolated_client.post(f"/api/tasks/{fresh['task_id']}/complete", json={"attempt_id": fresh["attempt_id"], "result_payload": {"preview_seeds": {"11": f"proj-s21/edits/{edit_id}/previews/seed_11.png"}}}, headers=worker_h)
+    from app.db import SessionLocal
+    from app.models import EditSession
+    with SessionLocal() as session:
+        edit = session.get(EditSession, edit_id)
+        assert edit is not None
+        edit.target_version_id = "v1"
+        session.commit()
     applied = isolated_client.post(f"/api/edits/{edit_id}/apply", json={"chosen_seed_id": "seed_11"}, headers=owner_h)
     assert applied.status_code == 200
+    assert applied.json()["target_version_id"] != "v1", "Applying again must preserve existing room versions"
     rebuild_id = applied.json()["id"]
     diff_id = applied.json()["diffusion_task_id"]
 

@@ -62,8 +62,11 @@ class S3Storage(StorageDriver):
         count = 0
         paginator = self.client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=normalized):
-            objects = page.get("Contents", [])
+            objects = [item for item in page.get("Contents", [])
+                       if item["Key"] == normalized or item["Key"].startswith(normalized + "/")]
             if objects:
-                self.client.delete_objects(Bucket=self.bucket, Delete={"Objects": [{"Key": x["Key"]} for x in objects]})
+                result = self.client.delete_objects(Bucket=self.bucket, Delete={"Objects": [{"Key": x["Key"]} for x in objects]})
+                if result.get("Errors"):
+                    raise OSError(f"S3 could not delete objects under {normalized}: {result['Errors']}")
                 count += len(objects)
         return count

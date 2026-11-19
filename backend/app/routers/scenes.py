@@ -6,7 +6,6 @@ from typing import BinaryIO
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -14,6 +13,7 @@ from ..config import get_settings
 from ..db import get_db
 from ..models import Project, SceneVersion
 from ..security import get_current_user, get_storage_actor
+from ..services.project_control import lock_project
 from ..storage import get_storage
 from ..storage.base import validate_key
 from .projects import _project
@@ -43,14 +43,16 @@ def manifest(project_id: str, version_id: str, session: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="manifest not found") from exc
 
 
-def _storage_project(session: Session, project_id: str, actor: tuple[bool, str | None]) -> Project:
+def _storage_project(session: Session, project_id: str, actor: tuple[bool, str | None], *, for_write: bool = False) -> Project:
     is_worker, user_id = actor
-    if is_worker:
-        project = session.get(Project, project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="project not found")
-        return project
-    return _project(session, project_id, user_id)
+    if not is_worker:
+        _project(session, project_id, user_id)
+    project = lock_project(session, project_id) if for_write else session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="project not found")
+    if for_write and project.processing_status != "running":
+        raise HTTPException(409, "Project processing is paused or stopped")
+    return project
 
 
 @router.post("/api/storage/{project_id}/{version_id}/upload")
@@ -61,7 +63,7 @@ def storage_upload(
     session: Session = Depends(get_db),
     actor: tuple[bool, str | None] = Depends(get_storage_actor),
 ) -> dict[str, object]:
-    _storage_project(session, project_id, actor)
+    _storage_project(session, project_id, actor, for_write=True)
     filename = file.filename or "upload"
     try:
         safe_version = validate_key(version_id)

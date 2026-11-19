@@ -1,21 +1,22 @@
-﻿export type TaskStatus = "queued" | "claimed" | "leased" | "running" | "completed" | "failed" | "cancelled";
+export type TaskStatus = "queued" | "claimed" | "leased" | "running" | "completed" | "failed" | "cancelled" | "paused" | "pausing" | "stopping";
 export type StageId = "01_extract" | "02_poses" | "03_train" | "04_export" | "05_track" | "06_diffusion" | "07_rebuild";
 export type RebuildMode = "masked_finetune" | "from_scratch";
 export type DiffusionModelVariant = "flux2_klein_4b" | "sdxl_inpaint_t4";
 
 export interface ResolveClickResponse { edit_id: string; ref_frame_idx: number; u: number; v: number; u_norm?: number; v_norm?: number; score: number; method: string; task_id: string; }
 export interface EditFrameItem { frame_idx: number; image_relpath: string | null; mask_key: string | null; mask_status: string; skip_frame: boolean; }
-export interface EditFramesResponse { edit_id: string; page: number; page_size: number; total: number; frames: EditFrameItem[]; }
+export interface EditCoverage { total: number; masked: number; skipped: number; missing: number; ready: boolean; }
+export interface EditFramesResponse { edit_id: string; page: number; page_size: number; total: number; frames: EditFrameItem[]; coverage?: EditCoverage | null; }
 export interface MaskUpdateResponse { edit_id: string; frame_idx: number; status: string; skip_frame: boolean; mask_key?: string | null; }
 export interface EditSummaryItem { id: string; project_id: string; base_version_id: string | null; target_version_id: string | null; ref_frame_idx: number | null; prompt: string | null; chosen_seed_id: string | null; status: string; }
 
-export interface Project { id: string; name: string; status: string; active_version_id: string | null; created_at: string; }
+export interface Project { processing_status?: "running" | "paused" | "stopped" | "deleting"; id: string; name: string; status: string; active_version_id: string | null; created_at: string; }
 export interface TaskSummary { id: string; type: string; status: TaskStatus; progress_pct: number; stage?: StageId; message?: string | null; telemetry?: Telemetry | null; }
 export interface Telemetry { vram_used_mb?: number; vram_total_mb?: number; runtime_seconds?: number; [key: string]: number | string | undefined; }
 export interface SceneVersion { id: string; label: string; parent_version_id: string | null; created_at: string; }
 export interface ProjectDetail extends Project { versions: Array<{ id: string; label: string }>; tasks: TaskSummary[]; edit_sessions: EditSession[]; }
 export interface MaskSummaryEntry { frame_idx: number; mask_key?: string | null; status?: string; skip_frame?: boolean; }
-export interface EditSession { id: string; status?: string; base_version_id?: string | null; target_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; mask_revision?: number; }
+export interface EditSession { prompt?: string | null; chosen_seed_id?: string | null; id: string; status?: string; base_version_id?: string | null; target_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; mask_revision?: number; }
 export interface ResolveClickBody {
   screenX?: number;
   screenY?: number;
@@ -113,6 +114,12 @@ export class RoomApi {
   listProjects(): Promise<Project[]> { return request(this.path("/api/projects"), this.token); }
   createProject(name: string): Promise<Project> { return request(this.path("/api/projects"), this.token, { method: "POST", body: JSON.stringify({ name }) }); }
   getProject(id: string): Promise<ProjectDetail> { return request(this.path(`/api/projects/${encodeURIComponent(id)}`), this.token); }
+  controlProject(id: string, action: "pause" | "resume" | "stop"): Promise<Project> {
+    return request(this.path(`/api/projects/${encodeURIComponent(id)}/processing`), this.token, { method: "POST", body: JSON.stringify({ action }) });
+  }
+  deleteProject(id: string): Promise<{ deleted: boolean }> {
+    return request(this.path(`/api/projects/${encodeURIComponent(id)}`), this.token, { method: "DELETE" });
+  }
   uploadVideo(projectId: string, file: File, onProgress?: (percent: number) => void): Promise<{ project_id: string; task_id: string; bytes: number }> {
     const validationError = validateVideo(file);
     if (validationError) return Promise.reject(new TypeError(validationError));
