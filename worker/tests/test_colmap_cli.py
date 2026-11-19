@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 
+import numpy as np
 import pytest
+from PIL import Image
 
 from room3d_worker import stage_cli
 from room3d_worker.common.errors import StageExecutionError
@@ -173,3 +176,86 @@ def test_stage_cli_sets_offscreen_for_direct_notebook_calls(tmp_path: Path, monk
 
     monkeypatch.setitem(stage_cli._STAGE_DISPATCH, "poses", check_environment)
     assert stage_cli.main(["poses", "--spec", str(spec)]) == 0
+
+
+@pytest.mark.parametrize("images_in_scene", [False, True])
+def test_colmap_fallback_keeps_raw_frames_and_native_destinations_isolated(
+    request_spec: PoseRequest, monkeypatch: pytest.MonkeyPatch, images_in_scene: bool,
+) -> None:
+    source = request_spec.output_dir / "images" if images_in_scene else request_spec.image_dir
+    source.mkdir(parents=True, exist_ok=True)
+    request = replace(request_spec, image_dir=source, width=650, height=490, frame_records=[
+        {"frame_idx": i, "orig_video_frame": i, "timestamp_sec": float(i),
+         "image_relpath": f"images/{i}.png"} for i in range(4)
+    ])
+    originals: dict[str, bytes] = {}
+    for i in range(4):
+        path = request.image_dir / f"{i}.png"
+        Image.new("RGB", (650, 490), (i * 20, 80, 160)).save(path)
+        originals[path.name] = path.read_bytes()
+    models: dict[str, SimpleNamespace] = {}
+    mapped: list[Path] = []
+    undistorted: list[Path] = []
+
+    def mapping(database: str, images: str, output: str, **options: object) -> dict[int, SimpleNamespace]:
+        assert {p.name: p.read_bytes() for p in Path(images).iterdir()} == originals
+        sparse = Path(output)
+        assert not any(sparse.iterdir()), "Mapper output from a previous attempt must never be reused"
+        mapped.append(sparse)
+        count = 3 if len(mapped) == 1 else 4
+        camera = SimpleNamespace(model="PINHOLE", width=650, height=490,
+                                 params=[520.0, 521.0, 325.0, 245.0])
+        registered: dict[int, SimpleNamespace] = {}
+        for i in range(count):
+            pose = np.eye(4)
+            pose[:3, 3] = [-float(i), -2.0, 0.0]
+            registered[i + 1] = SimpleNamespace(image_id=i + 1, name=f"{i}.png",
+                                                 camera_id=1, cam_from_world=pose)
+
+        def write_binary(output_path: str) -> None:
+            target = Path(output_path)
+            target.mkdir(parents=True, exist_ok=True)
+            for filename in ("cameras.bin", "images.bin", "points3D.bin"):
+                (target / filename).write_bytes(f"{count} {camera.width} {camera.params}".encode())
+
+        rec = SimpleNamespace(cameras={1: camera}, images=registered, points3D={
+            i: SimpleNamespace(xyz=np.array(xyz), color=(10, 20, 30))
+            for i, xyz in enumerate(((0, 0, 0), (1, 0, 0), (0, 0, 1)))
+        }, write_binary=write_binary, compute_mean_reprojection_error=lambda: 0.25)
+        models[str(sparse)] = rec
+        return {0: rec}
+
+    def undistort(output: str, sparse: str, images: str) -> None:
+        target = Path(output)
+        undistorted.append(target)
+        rec = models[sparse]
+        (target / "images").mkdir(parents=True)
+        for image in rec.images.values():
+            # COLMAP's native copy refuses existing files instead of replacing them.
+            with (target / "images" / image.name).open("xb") as handle:
+                handle.write((Path(images) / image.name).read_bytes())
+        rec.write_binary(str(target / "sparse"))
+        models[str(target / "sparse")] = rec
+
+    pycolmap = SimpleNamespace(global_mapping=mapping, incremental_mapping=mapping,
+                              undistort_images=undistort, Reconstruction=lambda path: models[path])
+    monkeypatch.setattr(s02_poses, "_module", lambda name: pycolmap)
+    monkeypatch.setattr(s02_poses.PyColmapBackend, "_extract", lambda *args: None)
+    backends: dict[s02_poses.BackendName, s02_poses.PoseBackend] = {
+        "colmap_global": s02_poses.PyColmapBackend("global"),
+        "colmap_incremental": s02_poses.PyColmapBackend("incremental"),
+    }
+    manifest, _ = s02_poses.estimate_poses(request, backends)
+    assert manifest.pose_backend == "colmap_incremental"
+    assert (manifest.width, manifest.height) == (640, 480)
+    assert manifest.intrinsics.cx == 320.0 and manifest.intrinsics.cy == 240.0
+    assert len(set(mapped)) == len(set(undistorted)) == 2
+    assert (request.output_dir / "sparse/0/cameras.bin").read_bytes().startswith(b"4 640")
+    for i in range(4):
+        with Image.open(request.output_dir / f"images/{i}.png") as published:
+            assert published.size == (640, 480)
+    if not images_in_scene:
+        assert {p.name: p.read_bytes() for p in request.image_dir.iterdir()} == originals
+        backends["colmap_incremental"].estimate(request)
+        assert len(set(mapped)) == len(set(undistorted)) == 3
+        assert {p.name: p.read_bytes() for p in request.image_dir.iterdir()} == originals

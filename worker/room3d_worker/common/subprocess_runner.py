@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,24 @@ def resolve_physical_gpu(preferred_gpu: int, gpu_count: int | None = None) -> in
     return 0
 
 
+def _failure_message(context: str, stderr: str) -> str:
+    # Native workers can log INFO lines after a fatal check and bury its cause.
+    print(f"{context}\n{stderr}", file=sys.stderr, flush=True)
+    context = context[:900]
+    prefix = f"{context}; stderr tail="
+    budget = 3200 - len(prefix)
+    diagnostic = re.sub(r"(?m)^I\d{8}\s[^\n]*(?:\n|$)", "", stderr)
+    if len(diagnostic) <= budget:
+        return prefix + diagnostic
+    fatal = re.findall(
+        r"(?m)^.*(?:F\d{8}\s|Check failed|FATAL|SIGABRT|SIGSEGV|"
+        r"terminate called|what\(\):|Fatal Python error).*$", diagnostic,
+    )
+    marker = "\n... stderr truncated ...\n"
+    head = "\n".join(fatal)[:budget // 2] if fatal else diagnostic[:budget // 2]
+    return prefix + head + marker + diagnostic[-(budget - len(head) - len(marker)):]
+
+
 def run_isolated_stage(
     cmd: list[str], cuda_device: str | None, env_extra: dict[str, str] | None, timeout_sec: int
 ) -> StageResult:
@@ -80,16 +99,13 @@ def run_isolated_stage(
             cmd, env=env, check=False, capture_output=True, text=True, timeout=timeout_sec, shell=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        stderr = exc.stderr if isinstance(exc, subprocess.TimeoutExpired) else None
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-        message = f"Stage command failed to execute {cmd!r}: {exc}; stderr tail={(stderr or '')[-3500:]}"
-        print(message, file=sys.stderr, flush=True)
+        raw_stderr = exc.stderr if isinstance(exc, subprocess.TimeoutExpired) else None
+        stderr = raw_stderr.decode("utf-8", errors="replace") if isinstance(raw_stderr, bytes) else raw_stderr or ""
+        message = _failure_message(f"Stage command failed to execute {cmd!r}: {exc}", stderr)
         raise StageExecutionError(message) from exc
     elapsed = time.perf_counter() - started
     if result.returncode != 0:
-        message = f"Stage command exited {result.returncode}: {cmd!r}; stderr tail={result.stderr[-3500:]}"
-        print(message, file=sys.stderr, flush=True)
+        message = _failure_message(f"Stage command exited {result.returncode}: {cmd!r}", result.stderr)
         raise StageExecutionError(message)
     return StageResult(tuple(cmd), result.returncode, elapsed, result.stdout, result.stderr)
 

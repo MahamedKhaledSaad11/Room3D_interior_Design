@@ -55,9 +55,16 @@ PyCOLMAP with the same thread cap. PyCOLMAP is still needed to read and normaliz
 See [COLMAP's CLI](https://colmap.github.io/cli.html) and
 [GLOMAP's mapper contract](https://github.com/colmap/glomap#usage).
 
-Failed stages print their command, exit code, and last 3,500 stderr characters in the Kaggle
-cell output. Timeouts retain partial stderr too. The backend retains the last 3,500 characters
-of the failure message for the UI, with the full error stored on the task attempt.
+Each COLMAP attempt uses a fresh workspace for mapper models, undistorted images, and
+normalized frames. Global-to-incremental fallback shares the feature database but reads the
+original extracted frames; only the selected attempt publishes images to the scene. This avoids
+native copy failures on existing undistortion destinations and stale mapper models.
+
+Failed stages print their command, exit code, and full captured stderr in the Kaggle cell output.
+The reported failure is bounded to 3,200 characters, removes COLMAP INFO chatter, and preserves
+fatal/check messages alongside the diagnostic tail. Timeouts retain partial stderr too. The
+backend stores the reported failure on the task attempt and up to 3,500 characters for the UI;
+the complete native log remains in Kaggle output.
 After pulling an update in Kaggle, stop and rerun Cell 12 so the daemon reloads its modules;
 restart the local backend after updating its failure-message handling. Submit a new task for
 a failed reconstruction. A passing local regression suite does not replace a live T4 run.

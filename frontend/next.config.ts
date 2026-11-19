@@ -7,6 +7,9 @@ const nextConfig: NextConfig = {
   devIndicators: process.env.ROOM3D_NEXT_DIST_DIR ? false : undefined,
   reactStrictMode: true,
   allowedDevOrigins: ["127.0.0.1", "localhost"],
+  experimental: {
+    middlewareClientMaxBodySize: "500mb",
+  },
   async rewrites() {
     return [{ source: "/api/:path*", destination: `${backendOrigin}/api/:path*` }];
   },

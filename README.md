@@ -146,8 +146,8 @@ $env:PYTHONPATH = "backend;worker"
 # Linux / macOS:
 export PYTHONPATH="backend:worker"
 
-# Install backend dependencies
-cd backend && pip install -r requirements.txt && cd ..
+# Install the backend, CPU worker, and test dependencies from the repository root
+python -m pip install -r requirements.txt
 
 # Seed the high-fidelity photorealistic living room demo
 python scripts/seed_demo.py
@@ -159,12 +159,19 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 #### 2. Launch Next.js Web Studio
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev -- -p 3000
 ```
 
 Open your browser at:
 👉 **[http://localhost:3000/projects/demo-room](http://localhost:3000/projects/demo-room)**
+
+The Python requirements are separate from the frontend's Node.js dependencies. For a GPU
+worker, select the [PyTorch build for your CUDA environment](https://pytorch.org/get-started/locally/)
+first, then install `requirements-gpu.txt`. GPU package and wheel availability depends on the OS,
+Python, and CUDA versions; model weights are downloaded separately. On Kaggle, use the notebook's
+Cell 2 instead so its existing PyTorch/CUDA installation is preserved. See
+[the live worker guide](docs/live_worker.md) for the tunnel and daemon setup.
 
 ---
 

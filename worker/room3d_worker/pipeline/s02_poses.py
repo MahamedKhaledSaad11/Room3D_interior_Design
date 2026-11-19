@@ -6,8 +6,9 @@ import json
 import os
 import shutil
 import struct
+import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
@@ -82,6 +83,7 @@ class BackendOutput:
     height: int | None = None
     intrinsics: dict[str, float] | None = None
     depths: Any = None
+    image_dir: Path | None = None
 
 
 class PoseBackend(Protocol):
@@ -317,6 +319,10 @@ class PyColmapBackend:
         if database.resolve().parent == request.image_dir.resolve() or request.image_dir.resolve() in database.resolve().parents:
             raise StageExecutionError("database.db must be outside image_dir")
         database.parent.mkdir(parents=True, exist_ok=True)
+        request.output_dir.mkdir(parents=True, exist_ok=True)
+        # Fallback must not reuse native copy destinations or publish over its input frames.
+        attempt_dir = Path(tempfile.mkdtemp(prefix=f"poses_{self.mode}_", dir=request.output_dir))
+        request = replace(request, output_dir=attempt_dir)
         extraction = self._extract(pycolmap, database, request)
         raw_sparse = request.output_dir / "raw_sparse"
         if self.mode == "global":
@@ -455,7 +461,7 @@ class PyColmapBackend:
         )
         if (new_w, new_h) != (orig_w, orig_h):
             _crop_images_to_mod16(
-                [request.output_dir / "undistorted" / "images", sparse_dir.parent / "images", request.image_dir],
+                [request.output_dir / "undistorted" / "images", sparse_dir.parent / "images"],
                 orig_w,
                 orig_h,
                 crop_box,
@@ -544,6 +550,7 @@ class PyColmapBackend:
             width=new_w,
             height=new_h,
             intrinsics=calibrated,
+            image_dir=request.output_dir / "images",
         )
 
 
@@ -1586,6 +1593,10 @@ def estimate_poses(request: PoseRequest, backends: dict[BackendName, PoseBackend
     sparse_dir = request.output_dir / "sparse" / "0"
     _copy_sparse(output.sparse_dir, sparse_dir)
     frames = output.frames or request.frame_records
+    if output.image_dir is not None:
+        _publish_mod16_images(
+            [output.image_dir], request.output_dir, frames, width, height, (0, 0, width, height),
+        )
     runtime_sec = time.perf_counter() - started
     peak_vram_mb = _peak_vram_mb()
     metrics = {

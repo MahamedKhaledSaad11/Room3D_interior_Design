@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     s3_region: str | None = None
     s3_access_key: str | None = None
     s3_secret_key: str | None = None
-    worker_token: str = "dev-worker-token"
+    worker_token: str = "room3d-dev-worker-token"
     jwt_secret: str = Field(default="dev-jwt-secret-change-me", min_length=16)
     auth_required: bool = False
     max_upload_bytes: int = 500 * 1024 * 1024
