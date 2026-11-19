@@ -1,0 +1,17 @@
+{
+  "id": "mohamedkhaledsaad/room3d-week-1-week-2-hybrid-lab",
+  "title": "Room3D Week 1 & Week 2 Hybrid Lab",
+  "code_file": "room3d_kaggle_lab.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [
+    "mohamedkhaledsaad/room3d-db-scenes"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

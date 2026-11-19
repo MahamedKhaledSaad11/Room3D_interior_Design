@@ -1,0 +1,165 @@
+"use client";
+
+import React from "react";
+import { appendAuthTokenQuery, storageKeyUrl, type EditFramesResponse } from "@/lib/api";
+
+export interface TrackingGridProps {
+  assetBaseUrl: string;
+  framesData: EditFramesResponse;
+  busy: boolean;
+  cacheKey?: number | string;
+  onPageChange: (page: number) => Promise<void>;
+  onToggleSkip: (frameIdx: number, skip: boolean) => Promise<void>;
+  onUploadMask: (frameIdx: number, file: File) => Promise<void>;
+  onSelectFrameForRefine?: (frameIdx: number) => void;
+}
+
+function cacheBustUrl(url: string, cacheKey: number | string): string {
+  return `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(String(cacheKey))}`;
+}
+
+export default function TrackingGrid({
+  assetBaseUrl,
+  framesData,
+  busy,
+  cacheKey = 0,
+  onPageChange,
+  onToggleSkip,
+  onUploadMask,
+  onSelectFrameForRefine,
+}: TrackingGridProps) {
+  const totalPages = Math.max(1, Math.ceil(framesData.total / Math.max(1, framesData.page_size)));
+
+  return (
+    <section aria-label="Tracked Frames Review Grid" style={{ display: "grid", gap: "10px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <strong>Tracked Frames ({framesData.total}) · unresolved views first</strong>
+        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <button type="button" disabled={busy || framesData.page <= 1} onClick={() => void onPageChange(framesData.page - 1)}>
+            Prev
+          </button>
+          <span>Page {framesData.page} / {totalPages}</span>
+          <button type="button" disabled={busy || framesData.page >= totalPages} onClick={() => void onPageChange(framesData.page + 1)}>
+            Next
+          </button>
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))",
+          gap: "8px",
+          overflowY: "auto",
+          padding: "4px",
+          border: "1px solid var(--line, #334155)",
+          borderRadius: "8px",
+        }}
+      >
+        {framesData.frames.map((item) => {
+          const thumbSrc = item.image_relpath
+            ? appendAuthTokenQuery(`${assetBaseUrl.replace(/\/+$/, "")}/${item.image_relpath.replace(/^\/+/, "")}`)
+            : null;
+          return (
+            <article
+              key={item.frame_idx}
+              style={{
+                border: "1px solid var(--line, #334155)",
+                borderRadius: "8px",
+                padding: "8px",
+                display: "grid",
+                gap: "6px",
+                background: "var(--card, #0f172a)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "11px", fontWeight: 600 }}>
+                <span>Frame #{item.frame_idx}</span>
+                <span style={{ color: item.mask_status === "unresolved" ? "var(--red, #f87171)" : "var(--green, #4ade80)" }}>
+                  {item.skip_frame ? (item.reviewed ? "Confirmed absent" : "Depth / SAM agree: absent") : item.mask_status}
+                </span>
+              </div>
+              <div
+                role={onSelectFrameForRefine ? "button" : undefined}
+                tabIndex={onSelectFrameForRefine ? 0 : undefined}
+                aria-label={onSelectFrameForRefine ? `Refine frame ${item.frame_idx}` : undefined}
+                onClick={() => onSelectFrameForRefine?.(item.frame_idx)}
+                onKeyDown={(e) => {
+                  if (onSelectFrameForRefine && (e.key === "Enter" || e.key === " ")) {
+                    e.preventDefault();
+                    onSelectFrameForRefine(item.frame_idx);
+                  }
+                }}
+                style={{ position: "relative", width: "100%", height: "210px", cursor: onSelectFrameForRefine ? "pointer" : "default" }}
+              >
+                {thumbSrc ? (
+                  <img
+                    src={thumbSrc}
+                    loading="lazy"
+                    decoding="async"
+                    alt={`Frame ${item.frame_idx}`}
+                    style={{ width: "100%", height: "210px", objectFit: "contain", borderRadius: "4px" }}
+                  />
+                ) : null}
+                {item.mask_key && !item.skip_frame ? (
+                  <img
+                    src={cacheBustUrl(storageKeyUrl(item.mask_key), cacheKey)}
+                    loading="lazy"
+                    decoding="async"
+                    alt={`Mask for frame ${item.frame_idx}`}
+                    data-testid={`mask-thumb-${item.frame_idx}`}
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      width: "100%",
+                      height: "210px",
+                      objectFit: "contain",
+                      pointerEvents: "none",
+                      mixBlendMode: "screen",
+                      opacity: 0.6,
+                      filter: "sepia(1) hue-rotate(95deg) saturate(6)",
+                    }}
+                  />
+                ) : null}
+              </div>
+              <p className="hint-text">{item.area_px === undefined || item.area_px === null ? "Area unknown" : `${item.area_px.toLocaleString()} selected pixels`}
+                {item.rejection_reason ? ` · ${item.rejection_reason.replaceAll("_", " ")}` : ""}</p>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  void onToggleSkip(item.frame_idx, !item.skip_frame);
+                  if (item.skip_frame && !item.mask_key) {
+                    onSelectFrameForRefine?.(item.frame_idx);
+                  }
+                }}
+                style={{ fontSize: "11px", padding: "4px 8px" }}
+              >
+                {item.skip_frame ? "Object is visible — correct mask" : "Confirm object absent / occluded"}
+              </button>
+              <label style={{ fontSize: "10px", cursor: "pointer", textAlign: "center" }}>
+                Upload PNG Mask
+                <input
+                  type="file"
+                  accept="image/png"
+                  aria-label={`Upload PNG mask for frame ${item.frame_idx}`}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) void onUploadMask(item.frame_idx, file);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+              {onSelectFrameForRefine ? (
+                <button type="button" disabled={busy} aria-label={`Mark object in frame ${item.frame_idx}`}
+                  onClick={() => onSelectFrameForRefine(item.frame_idx)}>
+                  Mark Object
+                </button>
+              ) : null}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}

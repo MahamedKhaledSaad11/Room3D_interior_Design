@@ -1,0 +1,704 @@
+from __future__ import annotations
+
+import importlib
+import inspect
+import json
+import os
+import tempfile
+import time
+from collections import OrderedDict
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, Protocol
+
+import cv2
+import numpy as np
+from numpy.typing import NDArray
+from PIL import Image
+
+from room3d_worker.common.coords import project_points_to_pixels, project_world_to_image, unproject_pixel_to_ray
+from room3d_worker.common.errors import GeometryError, StageExecutionError
+from room3d_worker.common.manifest import FrameRecord, SceneManifest
+from room3d_worker.common.progress import report_progress
+from room3d_worker.common.mask_evidence import mask_evidence
+
+MaskArray = NDArray[np.uint8]
+FloatArray = NDArray[np.float32]
+
+
+@dataclass(frozen=True)
+class PromptPoint:
+    x: float
+    y: float
+    label: Literal[0, 1]
+
+
+@dataclass(frozen=True)
+class ManualOverride:
+    frame_idx: int
+    mask_path: Path | None = None
+    skip_frame: bool = False
+
+
+class InteractiveSamBackend(Protocol):
+    def encode_image(self, image_path: Path) -> Any:
+        ...
+
+    def predict(self, embedding: Any, points: list[PromptPoint]) -> NDArray[Any]:
+        ...
+
+
+class VideoSamBackend(Protocol):
+    def propagate(
+        self,
+        image_paths: dict[int, Path],
+        ref_frame_idx: int,
+        seed_mask: MaskArray,
+        inference_state_device: str,
+    ) -> dict[int, MaskArray]:
+        ...
+
+
+class ReidEncoder(Protocol):
+    def embed_crop(self, rgb_crop: NDArray[np.uint8], mask_crop: MaskArray | None = None) -> FloatArray:
+        ...
+
+
+def normalize_binary_mask(raw_mask: NDArray[Any], expected_hw: tuple[int, int]) -> MaskArray:
+    """Convert bool/float/logits/uint8 mask outputs into strict 1-channel uint8 {0, 255}."""
+    arr = np.squeeze(np.asarray(raw_mask))
+    if arr.shape != expected_hw:
+        raise StageExecutionError(f"Mask shape {arr.shape} does not match expected {expected_hw}")
+    if arr.dtype == np.bool_:
+        return arr.astype(np.uint8) * np.uint8(255)
+    if np.issubdtype(arr.dtype, np.floating):
+        threshold = 0.5 if (arr.min(initial=0.0) >= 0.0 and arr.max(initial=0.0) <= 1.0) else 0.0
+    else:
+        threshold = 127 if arr.max(initial=0) > 1 else 0
+    return np.where(arr > threshold, np.uint8(255), np.uint8(0)).astype(np.uint8)
+
+
+def save_binary_mask_png(mask: NDArray[Any], path: Path, expected_hw: tuple[int, int]) -> Path:
+    normalized = normalize_binary_mask(mask, expected_hw)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(normalized).save(path, format="PNG")
+    return path
+
+
+def load_binary_mask_png(path: Path, expected_hw: tuple[int, int]) -> MaskArray:
+    if not path.exists():
+        raise StageExecutionError(f"Mask file missing: {path}")
+    with Image.open(path) as img:
+        img.load()
+        if img.mode != "L":
+            raise StageExecutionError(f"Mask must be mode 'L', got '{img.mode}': {path}")
+        arr = np.asarray(img, dtype=np.uint8)
+    if arr.shape != expected_hw or np.any((arr != 0) & (arr != 255)):
+        raise StageExecutionError(f"Invalid mask dimensions or pixel values: {path}")
+    return arr
+
+
+def mask_iou(a: MaskArray, b: MaskArray) -> float:
+    fa, fb = (a == 255), (b == 255)
+    union = int(np.logical_or(fa, fb).sum())
+    return 1.0 if union == 0 and not np.any(fa) else (float(np.logical_and(fa, fb).sum()) / union if union > 0 else 0.0)
+
+
+def _to_cpu_if_tensor(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _to_cpu_if_tensor(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu_if_tensor(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_if_tensor(v) for v in obj)
+    detached = obj.detach() if hasattr(obj, "detach") and callable(obj.detach) else obj
+    return detached.to("cpu") if hasattr(detached, "to") and callable(detached.to) else detached
+
+
+def _to_device_if_tensor(obj: Any, device: Any) -> Any:
+    if device is None:
+        return obj
+    if isinstance(obj, dict):
+        return {k: _to_device_if_tensor(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_device_if_tensor(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_device_if_tensor(v, device) for v in obj)
+    return obj.to(device) if hasattr(obj, "to") and callable(obj.to) else obj
+
+
+class WarmSamSession:
+    """Warm interactive SAM 2.1 predictor wrapper with bounded LRU frame-embedding cache."""
+
+    def __init__(self, backend: InteractiveSamBackend, max_cache_items: int = 8) -> None:
+        self._backend = backend
+        self._max_cache_items = max(1, int(max_cache_items))
+        self._cache: OrderedDict[tuple[str, int], Any] = OrderedDict()
+
+    def segment_clicks(
+        self,
+        image_path: Path,
+        points: Sequence[PromptPoint],
+        expected_hw: tuple[int, int],
+    ) -> tuple[MaskArray, float]:
+        if not points:
+            raise StageExecutionError("segment_clicks requires at least one prompt point")
+        started = time.perf_counter()
+        stat = image_path.stat()
+        key = (str(image_path.resolve()), stat.st_mtime_ns)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            self._cache[key] = _to_cpu_if_tensor(self._backend.encode_image(image_path))
+            while len(self._cache) > self._max_cache_items:
+                self._cache.popitem(last=False)
+        raw_mask = self._backend.predict(self._cache[key], list(points))
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        return normalize_binary_mask(raw_mask, expected_hw), latency_ms
+
+
+def track_vos(
+    video_backend: VideoSamBackend,
+    image_paths: dict[int, Path],
+    ref_frame_idx: int,
+    seed_mask: MaskArray,
+    expected_hw: tuple[int, int],
+    inference_state_device: str = "cpu",
+    anchors: dict[int, MaskArray] | None = None,
+) -> dict[int, MaskArray]:
+    if ref_frame_idx not in image_paths:
+        raise StageExecutionError(f"ref_frame_idx {ref_frame_idx} missing from image_paths")
+    seed = normalize_binary_mask(seed_mask, expected_hw)
+    kwargs = {"anchors": anchors} if "anchors" in inspect.signature(video_backend.propagate).parameters else {}
+    raw = video_backend.propagate(image_paths, ref_frame_idx, seed, inference_state_device, **kwargs)
+    return {
+        idx: (seed.copy() if idx == ref_frame_idx else normalize_binary_mask(raw[idx], expected_hw))
+        for idx in sorted(image_paths)
+        if idx in raw or idx == ref_frame_idx
+    }
+
+
+def _neighbor_drift_bad(
+    idx: int,
+    pos: int,
+    ordered: list[int],
+    masks: dict[int, MaskArray],
+    min_iou: float,
+    max_area_ratio: float,
+) -> bool:
+    neighbors = [masks[ordered[n]] for n in (pos - 1, pos + 1) if 0 <= n < len(ordered)]
+    if not neighbors:
+        return False
+    cur = masks[idx]
+    ious = [mask_iou(cur, nb) for nb in neighbors]
+    areas = [max(int((nb == 255).sum()), 1) for nb in neighbors]
+    cur_area = int((cur == 255).sum())
+    return max(ious) < min_iou or any((cur_area / a) > max_area_ratio for a in areas)
+
+
+def filter_neighbor_iou(
+    masks: dict[int, MaskArray],
+    ref_frame_idx: int,
+    min_iou: float = 0.25,
+    max_area_ratio: float = 3.5,
+) -> tuple[dict[int, MaskArray], set[int]]:
+    """Tier 2: flag frames with sudden neighbor IoU collapse or area spikes relative to neighbors."""
+    ordered = sorted(masks)
+    flagged = {
+        idx
+        for pos, idx in enumerate(ordered)
+        if idx != ref_frame_idx and _neighbor_drift_bad(idx, pos, ordered, masks, min_iou, max_area_ratio)
+    }
+    return {k: v.copy() for k, v in masks.items()}, flagged
+
+
+def _load_depth_map(depth_dir: Path | None, frame_idx: int) -> FloatArray | None:
+    if depth_dir is None:
+        return None
+    for name in (f"{frame_idx:06d}.npy", f"{frame_idx:05d}.npy", f"depth_{frame_idx:05d}.npy"):
+        npy_path = depth_dir / name
+        if npy_path.exists():
+            return np.load(npy_path, allow_pickle=False).astype(np.float32)
+    return None
+
+
+def _lift_foreground_points(
+    mask: MaskArray,
+    pose: NDArray[np.float64],
+    intrinsics: dict[str, float],
+    depth_map: FloatArray | None,
+    max_samples: int = 256,
+) -> NDArray[np.float64]:
+    if depth_map is None:
+        return np.empty((0, 3), dtype=np.float64)
+    ys, xs = np.nonzero(mask == 255)
+    if len(xs) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    step = max(1, len(xs) // max_samples)
+    pts: list[NDArray[np.float64]] = []
+    for x, y in zip(xs[::step], ys[::step]):
+        d = float(depth_map[y, x])
+        if not np.isfinite(d) or d <= 1e-3:
+            continue
+        origin, direction = unproject_pixel_to_ray(float(x), float(y), pose, intrinsics)
+        z_cam = float((pose[:3, :3] @ direction)[2])
+        if z_cam > 1e-4:
+            pts.append(origin + direction * (d / z_cam))
+    return np.asarray(pts, dtype=np.float64) if pts else np.empty((0, 3), dtype=np.float64)
+
+
+def _classify_frame_visibility(
+    pts_3d: NDArray[np.float64],
+    pose: NDArray[np.float64],
+    intrinsics: dict[str, float],
+    hw: tuple[int, int],
+    depth_map: FloatArray | None,
+    occlusion_tol: float,
+) -> tuple[str, tuple[float, float] | None]:
+    h, w = hw
+    visible_uvs: list[tuple[float, float]] = []
+    occluded = 0
+    for pt in pts_3d:
+        try:
+            u, v, z = project_world_to_image(pt, pose, intrinsics)
+        except GeometryError as exc:
+            if "behind camera" in str(exc):
+                continue
+            raise
+        if z <= 1e-4 or not (0.0 <= u < w and 0.0 <= v < h):
+            continue
+        visible_uvs.append((u, v))
+        sampled = float(depth_map[int(v), int(u)]) if depth_map is not None else float("nan")
+        if np.isfinite(sampled) and sampled > 1e-3 and z > sampled + occlusion_tol:
+            occluded += 1
+    if not visible_uvs:
+        return "out_of_frustum", None
+    if occluded > int(0.85 * len(visible_uvs)):
+        return "occluded", None
+    arr = np.asarray(visible_uvs, dtype=np.float64)
+    return "visible", (float(arr[:, 0].mean()), float(arr[:, 1].mean()))
+
+
+def lift_and_reproject_masks(
+    masks: dict[int, MaskArray],
+    manifest: SceneManifest,
+    image_paths: dict[int, Path],
+    depth_dir: Path | None,
+    ref_frame_idx: int,
+    sam_session: WarmSamSession,
+    occlusion_tol: float = 0.25,
+    require_confident_depth: bool = False,
+) -> tuple[dict[int, MaskArray], dict[int, str], set[int]]:
+    """Tier 3: Lift reference mask to 3D, suppress OOF/occluded views, and re-prompt re-entries."""
+    if ref_frame_idx not in masks or not np.any(masks[ref_frame_idx] == 255):
+        return {k: v.copy() for k, v in masks.items()}, {idx: "empty_ref" for idx in masks}, set()
+    hw = (manifest.height, manifest.width)
+    intrinsics = manifest.intrinsics.model_dump()
+    frames_by_idx = {f.frame_idx: f for f in manifest.frames}
+    ref_depth = _load_depth_map(depth_dir, ref_frame_idx)
+    if require_confident_depth:
+        alpha_path = depth_dir / f"{ref_frame_idx:06d}_alpha.npy" if depth_dir else None
+        if ref_depth is None or alpha_path is None or not alpha_path.is_file():
+            return {k: v.copy() for k, v in masks.items()}, {idx: "no_confident_depth" for idx in masks}, set()
+        ref_depth = np.where(np.load(alpha_path, allow_pickle=False) >= 0.7, ref_depth, np.nan)
+    ref_frame = frames_by_idx.get(ref_frame_idx)
+    if ref_depth is None or ref_frame is None or ref_frame.cam_from_world is None:
+        return {k: v.copy() for k, v in masks.items()}, {idx: "no_depth" for idx in masks}, set()
+    pts_3d = _lift_foreground_points(
+        masks[ref_frame_idx],
+        np.asarray(ref_frame.cam_from_world, dtype=np.float64),
+        intrinsics,
+        ref_depth,
+    )
+    if len(pts_3d) == 0:
+        return {k: v.copy() for k, v in masks.items()}, {idx: "no_depth" for idx in masks}, set()
+    area = int(np.count_nonzero(masks[ref_frame_idx]))
+    sampled_count = len(range(0, area, max(1, area // 256)))
+    if require_confident_depth and len(pts_3d) < max(16, 0.8 * sampled_count):
+        return {k: v.copy() for k, v in masks.items()}, {idx: "insufficient_depth_support" for idx in masks}, set()
+
+    updated = {k: v.copy() for k, v in masks.items()}
+    visibility: dict[int, str] = {}
+    recovered: set[int] = set()
+    saw_hidden = False
+    for idx in sorted(image_paths):
+        target_depth = _load_depth_map(depth_dir, idx)
+        if require_confident_depth and target_depth is not None and depth_dir is not None:
+            alpha_path = depth_dir / f"{idx:06d}_alpha.npy"
+            target_depth = (np.where(np.load(alpha_path, allow_pickle=False) >= 0.7, target_depth, np.nan)
+                            if alpha_path.is_file() else None)
+        target_frame = frames_by_idx.get(idx)
+        if target_depth is None or target_frame is None or target_frame.cam_from_world is None:
+            # Trust VOS mask directly when per-frame depth or pose is unavailable.
+            visibility[idx] = "no_depth"
+            continue
+        pose = np.asarray(target_frame.cam_from_world, dtype=np.float64)
+        vis, hint_uv = _classify_frame_visibility(pts_3d, pose, intrinsics, hw, target_depth, occlusion_tol)
+        visibility[idx] = vis
+        if vis != "visible":
+            updated[idx] = np.zeros(hw, dtype=np.uint8)
+            saw_hidden = True
+        elif saw_hidden and not np.any(updated.get(idx, 0) == 255) and hint_uv is not None:
+            re_mask, _ = sam_session.segment_clicks(image_paths[idx], [PromptPoint(hint_uv[0], hint_uv[1], 1)], hw)
+            if np.any(re_mask == 255):
+                updated[idx] = re_mask
+                recovered.add(idx)
+    return updated, visibility, recovered
+
+
+class _HistogramReidEncoder:
+    def embed_crop(self, rgb_crop: NDArray[np.uint8], mask_crop: MaskArray | None = None) -> FloatArray:
+        hsv = cv2.cvtColor(rgb_crop, cv2.COLOR_RGB2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], mask_crop, [16, 8], [0, 180, 0, 256]).astype(np.float32).reshape(-1)
+        norm = float(np.linalg.norm(hist))
+        return hist / norm if norm > 1e-8 else hist
+
+
+def _crop_masked_rgb(image_path: Path, mask: MaskArray) -> tuple[NDArray[np.uint8], MaskArray] | None:
+    ys, xs = np.nonzero(mask == 255)
+    if len(xs) == 0:
+        return None
+    with Image.open(image_path) as img:
+        rgb = np.asarray(img.convert("RGB"), dtype=np.uint8)
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    mask_crop = np.where(mask[y0:y1, x0:x1] == 255, np.uint8(255), np.uint8(0)).astype(np.uint8)
+    crop = rgb[y0:y1, x0:x1].copy()
+    crop[mask_crop == 0] = 0
+    return crop, mask_crop
+
+
+def score_reid_crops(
+    image_paths: dict[int, Path],
+    masks: dict[int, MaskArray],
+    ref_frame_idx: int,
+    encoder: ReidEncoder | None = None,
+    min_similarity: float = 0.65,
+) -> tuple[dict[int, float], set[int]]:
+    """Tier 4: crop masked detections and reject ID switches via Re-ID cosine similarity."""
+    reid = encoder or _HistogramReidEncoder()
+    ref_data = _crop_masked_rgb(image_paths[ref_frame_idx], masks[ref_frame_idx])
+    if ref_data is None:
+        return {}, set()
+    ref_emb = reid.embed_crop(*ref_data)
+    scores: dict[int, float] = {}
+    rejected: set[int] = set()
+    for idx, mask in sorted(masks.items()):
+        crop_data = _crop_masked_rgb(image_paths[idx], mask)
+        if crop_data is None:
+            continue
+        emb = reid.embed_crop(*crop_data)
+        sim = float(np.dot(ref_emb, emb) / max(float(np.linalg.norm(ref_emb) * np.linalg.norm(emb)), 1e-8))
+        scores[idx] = sim
+        if idx != ref_frame_idx and sim < min_similarity:
+            rejected.add(idx)
+    return scores, rejected
+
+
+def project_3dgs_mask_hints(
+    points_world: NDArray[Any],
+    frame: FrameRecord,
+    intrinsics: dict[str, float],
+    hw: tuple[int, int],
+) -> MaskArray:
+    """Tier 5: project reference 3D foreground Gaussian subset back to candidate 2D mask hints."""
+    h, w = hw
+    hint = np.zeros((h, w), dtype=np.uint8)
+    if frame.cam_from_world is None:
+        return hint
+    pose = np.asarray(frame.cam_from_world, dtype=np.float64)
+    for pt in np.asarray(points_world, dtype=np.float64):
+        try:
+            u, v, depth = project_world_to_image(pt, pose, intrinsics)
+        except GeometryError as exc:
+            if "behind camera" in str(exc):
+                continue
+            raise
+        if depth > 1e-4 and 0.0 <= u < w and 0.0 <= v < h:
+            hint[int(v), int(u)] = 255
+    return hint
+
+
+def apply_manual_mask_overrides(
+    masks: dict[int, MaskArray],
+    overrides: Sequence[ManualOverride],
+    expected_hw: tuple[int, int],
+) -> tuple[dict[int, MaskArray], set[int]]:
+    updated = {k: v.copy() for k, v in masks.items()}
+    skipped: set[int] = set()
+    for item in overrides:
+        if item.skip_frame:
+            skipped.add(item.frame_idx)
+            updated[item.frame_idx] = np.zeros(expected_hw, dtype=np.uint8)
+        elif item.mask_path is not None:
+            updated[item.frame_idx] = load_binary_mask_png(item.mask_path, expected_hw)
+            skipped.discard(item.frame_idx)
+    return updated, skipped
+
+
+def write_tracking_report(output_path: Path, report: dict[str, Any]) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return output_path
+
+
+def anchor_mask_agreement(masks: dict[int, MaskArray], anchors: dict[int, MaskArray], manifest: SceneManifest,
+                          depth_dir: Path | None) -> dict[int, float]:
+    if depth_dir is None:
+        return {}
+    clouds: list[NDArray[np.float64]] = []
+    frames = {frame.frame_idx: frame for frame in manifest.frames}
+    intrinsics = manifest.intrinsics.model_dump()
+    for idx, mask in anchors.items():
+        frame = frames.get(idx)
+        depth = _load_depth_map(depth_dir, idx)
+        alpha_path = depth_dir / f"{idx:06d}_alpha.npy"
+        if frame is None or frame.cam_from_world is None or depth is None or not alpha_path.is_file():
+            continue
+        trusted = np.where(np.load(alpha_path, allow_pickle=False) >= 0.7, depth, np.nan)
+        cloud = _lift_foreground_points(mask, np.asarray(frame.cam_from_world), intrinsics, trusted)
+        if len(cloud):
+            clouds.append(cloud)
+    if not clouds:
+        return {}
+    points = np.concatenate(clouds)
+    scores: dict[int, float] = {}
+    for idx, mask in masks.items():
+        frame = frames.get(idx)
+        depth = _load_depth_map(depth_dir, idx)
+        alpha_path = depth_dir / f"{idx:06d}_alpha.npy"
+        if frame is None or frame.cam_from_world is None or depth is None or not alpha_path.is_file():
+            continue
+        alpha = np.load(alpha_path, allow_pickle=False)
+        _, u, v, z = project_points_to_pixels(points, np.asarray(frame.cam_from_world), intrinsics, manifest.width, manifest.height)
+        supported = (alpha[v, u] >= 0.7) & np.isfinite(depth[v, u]) & (np.abs(z - depth[v, u]) <= np.maximum(0.05 * z, 1e-4))
+        if np.count_nonzero(supported) >= 8:
+            scores[idx] = float(np.mean(mask[v[supported], u[supported]] == 255))
+    return scores
+
+
+def run_tracking_pipeline(
+    manifest: SceneManifest,
+    image_paths: dict[int, Path],
+    ref_frame_idx: int,
+    points: Sequence[PromptPoint],
+    sam_session: WarmSamSession,
+    video_backend: VideoSamBackend,
+    output_dir: Path,
+    depth_dir: Path | None = None,
+    reid_encoder: ReidEncoder | None = None,
+    overrides: Sequence[ManualOverride] = (),
+) -> tuple[dict[int, Path], dict[str, Any]]:
+    """Run SAM 2.1 click refinement and 5-tier propagation, returning mask PNGs and metrics."""
+    hw = (manifest.height, manifest.width)
+    started = time.perf_counter()
+    seed_mask, click_ms = sam_session.segment_clicks(image_paths[ref_frame_idx], points, hw)
+    anchors = {item.frame_idx: load_binary_mask_png(item.mask_path, hw) for item in overrides
+               if item.mask_path is not None and not item.skip_frame}
+    seed_mask = anchors.get(ref_frame_idx, seed_mask)
+    report_progress("05_track", 5, "Reference mask ready; propagating through video")
+    sam_started = time.perf_counter()
+    raw_masks = track_vos(video_backend, image_paths, ref_frame_idx, seed_mask, hw, inference_state_device="cpu", anchors=anchors)
+    sam_sec = time.perf_counter() - sam_started
+    for idx in image_paths:
+        raw_masks.setdefault(idx, np.zeros(hw, dtype=np.uint8))
+    for idx, mask in raw_masks.items():
+        save_binary_mask_png(mask, output_dir / "raw_masks" / f"{idx:06d}.png", hw)
+    report_progress("05_track", 65, "Validating tracked masks across views")
+    _, iou_flagged = filter_neighbor_iou(raw_masks, ref_frame_idx)
+    reprojected, visibility, recovered = lift_and_reproject_masks(raw_masks, manifest, image_paths, depth_dir, ref_frame_idx, sam_session,
+                                                               require_confident_depth=True)
+    agreement = anchor_mask_agreement(reprojected, {ref_frame_idx: seed_mask, **anchors}, manifest, depth_dir)
+    geometrically_supported = {idx for idx, score in agreement.items() if score >= 0.8}
+    geometric_rejected = {idx for idx, score in agreement.items() if score < 0.6}
+    unresolved_iou = iou_flagged - recovered - geometrically_supported
+    for bad_idx in unresolved_iou | geometric_rejected:
+        reprojected[bad_idx] = np.zeros(hw, dtype=np.uint8)
+    reid_scores, reid_rejected = score_reid_crops(image_paths, reprojected, ref_frame_idx, reid_encoder)
+    for rej in reid_rejected:
+        reprojected[rej] = np.zeros(hw, dtype=np.uint8)
+    final_masks, skipped = apply_manual_mask_overrides(reprojected, overrides, hw)
+    report_progress("05_track", 85, "Applied manual mask corrections")
+    masks_dir = output_dir / "masks"
+    saved = {idx: save_binary_mask_png(mask, masks_dir / f"{idx:06d}.png", hw) for idx, mask in sorted(final_masks.items())}
+    evidence: dict[str, dict[str, object]] = {}
+    for idx, path in saved.items():
+        detail = mask_evidence(path)
+        reasons = []
+        if idx in unresolved_iou:
+            reasons.append("neighbor_drift")
+        if idx in geometric_rejected:
+            reasons.append("anchor_geometry_mismatch")
+        if idx in reid_rejected:
+            reasons.append("appearance_mismatch")
+        if idx in recovered:
+            reasons.append("reentry_requires_review")
+        if visibility.get(idx) in {"occluded", "out_of_frustum"}:
+            reasons.append(str(visibility[idx]))
+        detail.update(raw_area_px=int(np.count_nonzero(raw_masks[idx])), depth_visibility=visibility.get(idx),
+                      reid_similarity=reid_scores.get(idx), anchor_agreement=agreement.get(idx),
+                      rejection_reason=";".join(reasons) or detail["rejection_reason"])
+        if idx in anchors or idx == ref_frame_idx:
+            detail.update(reviewed=True, rejection_reason=None if detail["area_px"] else "empty_anchor")
+        if idx in skipped:
+            detail.update(reviewed=True, visibility="absent", rejection_reason=None)
+        elif (idx not in anchors and idx != ref_frame_idx and not raw_masks[idx].any()
+              and visibility.get(idx) in {"occluded", "out_of_frustum"}):
+            detail.update(skip_frame=True, visibility=visibility[idx], rejection_reason=None,
+                          absence_evidence="trusted_depth_and_empty_raw_sam")
+        evidence[str(idx)] = detail
+    stats = {
+        "ref_frame_idx": ref_frame_idx, "click_latency_ms": round(click_ms, 2),
+        "total_frames": len(image_paths), "iou_flagged": sorted(iou_flagged),
+        "recovered_reentries": sorted(recovered), "reid_rejected": sorted(reid_rejected),
+        "skipped_frames": sorted(skipped), "reid_scores": reid_scores, "visibility": visibility,
+        "frame_evidence": evidence, "sam_propagation_sec": round(sam_sec, 4),
+        "geometric_rejected": sorted(geometric_rejected), "anchor_agreement": agreement,
+        "confident_absent_frames": [int(idx) for idx, detail in evidence.items() if detail.get("absence_evidence")],
+        "runtime_sec": round(time.perf_counter() - started, 4),
+    }
+    write_tracking_report(output_dir / "tracking_report.json", stats)
+    return saved, stats
+
+
+def _resolve_sam_device(device: str, torch_mod: Any) -> str:
+    if not torch_mod.cuda.is_available() or device == "cpu":
+        return "cpu"
+    if device.startswith("cuda:"):
+        ordinal = int(device.split(":")[1])
+        return device if ordinal < torch_mod.cuda.device_count() else "cuda:0"
+    return "cuda:0"
+
+
+def _predictor_device(predictor: Any) -> Any:
+    device = getattr(predictor, "device", None)
+    if device is not None:
+        return device
+    model = getattr(predictor, "model", None)
+    if model is None:
+        return None
+    model_device = getattr(model, "device", None)
+    if model_device is not None:
+        return model_device
+    params = getattr(model, "parameters", None)
+    if callable(params):
+        try:
+            return next(iter(params())).device
+        except (StopIteration, AttributeError, TypeError):
+            return None
+    return None
+
+
+def _to_numpy(value: Any) -> NDArray[Any]:
+    if hasattr(value, "detach") and callable(value.detach):
+        value = value.detach()
+    if hasattr(value, "cpu") and callable(value.cpu):
+        value = value.cpu()
+    return value.numpy() if hasattr(value, "numpy") and callable(value.numpy) else np.asarray(value)
+
+
+def _logits_to_binary_mask(logits: Any) -> MaskArray:
+    mask_arr = _to_numpy(logits[0] > 0.0)
+    return np.asarray(mask_arr, dtype=np.uint8) * np.uint8(255)
+
+
+class _Sam2Interactive:
+    def __init__(self, image_predictor: Any) -> None:
+        self._pred = image_predictor
+
+    def encode_image(self, image_path: Path) -> dict[str, Any]:
+        with Image.open(image_path) as img:
+            self._pred.set_image(np.asarray(img.convert("RGB"), dtype=np.uint8))
+        return {"features": self._pred._features, "orig_hw": self._pred._orig_hw}
+
+    def predict(self, embedding: Any, points: list[PromptPoint]) -> NDArray[Any]:
+        device = _predictor_device(self._pred)
+        # Cached embeddings live on CPU RAM; move tensors back to predictor device on cache hit.
+        self._pred._features = _to_device_if_tensor(embedding["features"], device)
+        self._pred._orig_hw = embedding["orig_hw"]
+        self._pred._is_image_set = True
+        coords = np.array([[p.x, p.y] for p in points], dtype=np.float32)
+        labels = np.array([p.label for p in points], dtype=np.int32)
+        masks, _, _ = self._pred.predict(point_coords=coords, point_labels=labels, multimask_output=False)
+        return _to_numpy(masks[0])
+
+
+_Sam2Image = _Sam2Interactive
+
+
+class _Sam2Video:
+    def __init__(self, video_predictor: Any) -> None:
+        self._pred = video_predictor
+
+    def _propagate_kwargs(self, ref_pos: int, reverse: bool) -> tuple[bool, dict[str, Any]]:
+        try:
+            params = inspect.signature(self._pred.propagate_in_video).parameters
+        except (TypeError, ValueError):
+            return False, {}
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        supports_start = "start_frame_idx" in params or has_varkw
+        supports_reverse = "reverse" in params or has_varkw
+        kwargs: dict[str, Any] = {}
+        if supports_start:
+            kwargs["start_frame_idx"] = ref_pos
+        if supports_reverse:
+            kwargs["reverse"] = reverse
+        return supports_start and supports_reverse, kwargs
+
+    def propagate(
+        self,
+        image_paths: dict[int, Path],
+        ref_frame_idx: int,
+        seed_mask: MaskArray,
+        inference_state_device: str,
+        anchors: dict[int, MaskArray] | None = None,
+    ) -> dict[int, MaskArray]:
+        ordered_keys = sorted(image_paths)
+        idx_map = {pos: idx for pos, idx in enumerate(ordered_keys)}
+        rev_map = {idx: pos for pos, idx in idx_map.items()}
+        ref_pos = rev_map[ref_frame_idx]
+        with tempfile.TemporaryDirectory(prefix="sam2_frames_") as tmp_dir:
+            for pos, orig_idx in idx_map.items():
+                with Image.open(image_paths[orig_idx]) as img:
+                    img.convert("RGB").save(Path(tmp_dir) / f"{pos:06d}.jpg", format="JPEG", quality=95)
+            state = self._pred.init_state(
+                video_path=tmp_dir,
+                offload_video_to_cpu=(inference_state_device == "cpu"),
+                offload_state_to_cpu=(inference_state_device == "cpu"),
+            )
+            self._pred.add_new_mask(state, frame_idx=ref_pos, obj_id=1, mask=(seed_mask == 255))
+            for idx, mask in (anchors or {}).items():
+                if idx != ref_frame_idx and idx in rev_map:
+                    self._pred.add_new_mask(state, frame_idx=rev_map[idx], obj_id=1, mask=(mask == 255))
+            supports_bidir, fwd_kwargs = self._propagate_kwargs(ref_pos, reverse=False)
+            results: dict[int, MaskArray] = {}
+            for pos, _obj_ids, logits in self._pred.propagate_in_video(state, **fwd_kwargs):
+                results[idx_map[pos]] = _logits_to_binary_mask(logits)
+                report_progress("05_track", 5 + 55 * len(results) / len(ordered_keys),
+                                f"Tracked {len(results)}/{len(ordered_keys)} frames")
+            if ref_pos > 0 and supports_bidir:
+                _, rev_kwargs = self._propagate_kwargs(ref_pos, reverse=True)
+                for pos, _obj_ids, logits in self._pred.propagate_in_video(state, **rev_kwargs):
+                    orig_idx = idx_map[pos]
+                    if orig_idx not in results or pos < ref_pos:
+                        results[orig_idx] = _logits_to_binary_mask(logits)
+            return results
+
+
+def load_sam2_backends(model_cfg: str, checkpoint: str, device: str = "cuda:1") -> tuple[InteractiveSamBackend, VideoSamBackend]:
+    """Lazy loader for official SAM 2.1 checkpoints on cuda:1 with safe CPU offload for VOS."""
+    try:
+        torch = importlib.import_module("torch")
+        sam2_build = importlib.import_module("sam2.build_sam")
+        sam2_pred = importlib.import_module("sam2.sam2_image_predictor")
+    except ImportError as exc:
+        raise StageExecutionError("s05_track requires torch and sam2 when loading live SAM 2.1 weights") from exc
+    resolved = _resolve_sam_device(device, torch)
+    if not checkpoint and hasattr(sam2_build, "build_sam2_hf") and hasattr(sam2_build, "build_sam2_video_predictor_hf"):
+        hf_id = os.environ.get("ROOM3D_SAM2_HF_MODEL", "facebook/sam2.1-hiera-small")
+        sam_model = sam2_build.build_sam2_hf(hf_id, device=resolved)
+        video_predictor = sam2_build.build_sam2_video_predictor_hf(hf_id, device=resolved)
+    else:
+        sam_model = sam2_build.build_sam2(model_cfg, checkpoint, device=resolved)
+        video_predictor = sam2_build.build_sam2_video_predictor(model_cfg, checkpoint, device=resolved)
+    return _Sam2Interactive(sam2_pred.SAM2ImagePredictor(sam_model)), _Sam2Video(video_predictor)
