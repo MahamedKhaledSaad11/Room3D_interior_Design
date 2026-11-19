@@ -1,6 +1,0 @@
-# Install after choosing the PyTorch build appropriate for your CUDA environment.
-# Kaggle: use the notebook's Cell 2 instead, which preserves its preinstalled CUDA stack.
--r requirements.txt
--e ./worker[gpu]
-optimum-quanto>=0.2.5
-git+https://github.com/facebookresearch/sam2.git
