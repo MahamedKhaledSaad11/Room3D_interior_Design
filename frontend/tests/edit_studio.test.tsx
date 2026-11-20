@@ -38,6 +38,30 @@ describe("EditStudio interactive Week 2 workflow", () => {
     vi.restoreAllMocks();
   });
 
+  it("restores the saved generative preset and seed when continuing a failed edit", async () => {
+    const previous: EditSession = { id: "failed-edit", status: "failed", base_version_id: "v1", ref_frame_idx: 2,
+      prompt: "blue leather", chosen_seed_id: "202", preview_seeds: { "202": "preview.png" },
+      preview_settings: { operation: "generative", quality_preset: "quality", color_hex: "#2563eb", color_strength: 1,
+        model_variant: "flux2_klein_4b" } };
+    vi.spyOn(roomApi, "getEdit").mockResolvedValue(previous);
+    vi.spyOn(roomApi, "editFrames").mockResolvedValue({ edit_id: previous.id, page: 1, page_size: 24, total: 1,
+      coverage: { total: 1, masked: 1, skipped: 0, missing: 0, ready: true },
+      frames: [{ frame_idx: 2, image_relpath: "images/2.png", mask_status: "manual", mask_key: "mask.png", skip_frame: false }] });
+    render(<EditStudio projectId="proj-w2" project={{ ...project, edit_sessions: [previous] }}
+      manifest={{ width: 640, height: 480, frames: [{ frame_idx: 2, image_relpath: "images/2.png" }] }}
+      controller={controller} assetBaseUrl="/api/storage/proj-w2/v1" activeVersionId="v1"
+      onSelectVersion={vi.fn()} onRefreshProject={async () => undefined} />);
+    fireEvent.change(screen.getByLabelText("Continue previous edit"), { target: { value: previous.id } });
+    await waitFor(() => expect(roomApi.editFrames).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: /Review views/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "I checked the selection in different views" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue to color preview" }));
+    expect(screen.getByLabelText("Edit operation")).toHaveValue("generative");
+    expect(screen.getByLabelText("Sampling preset")).toHaveValue("quality");
+    expect(screen.getByLabelText("Chosen Diffusion Seed")).toHaveValue("202");
+    expect(screen.getByLabelText("Edit instruction prompt")).toHaveValue("blue leather");
+  });
+
   it("drives click resolve -> refine -> track -> skip/mask upload -> seed preview -> apply -> version switch", async () => {
     let latest: EditSession = { id: "edit-1234", status: "segmented", base_version_id: "v1", ref_frame_idx: 2 };
     vi.spyOn(roomApi, "getEdit").mockImplementation(async () => latest);
@@ -144,7 +168,7 @@ describe("EditStudio interactive Week 2 workflow", () => {
     fireEvent.click(screen.getByRole("button", { name: "Continue to color preview" }));
     fireEvent.change(screen.getByLabelText("Edit operation"), { target: { value: "generative" } });
     fireEvent.change(screen.getByLabelText("Edit instruction prompt"), { target: { value: "emerald armchair" } });
-    fireEvent.click(screen.getByRole("button", { name: "Generate color previews" }));
+    fireEvent.click(screen.getByRole("button", { name: "Generate reference edit previews" }));
     await waitFor(() => expect(previewSpy).toHaveBeenCalledWith("edit-1234", "emerald armchair", [101, 202, 303, 404], "flux2_klein_4b", undefined, expect.objectContaining({ operation: "generative" })));
     await waitFor(() => expect(screen.getAllByRole("img", { name: /Preview for/ })).toHaveLength(4));
     fireEvent.click(screen.getByRole("button", { name: "Choose look 2" }));

@@ -360,6 +360,17 @@ def test_apply_barrier_completion_failure_cascade_and_idempotency(isolated_clien
     assert rebuild_task["status"] == "failed"
     edits = isolated_client.get("/api/projects/proj-s21/edits", headers=owner_h).json()
     assert edits[0]["status"] == "failed"
+    assert edits[0]["preview_settings"]["operation"] == "generative"
+    assert edits[0]["preview_settings"]["quality_preset"] == "fast"
+    assert proj_state["active_version_id"] == "v1"
+    retry = isolated_client.post(f"/api/edits/{edit_id}/apply", json={"chosen_seed_id": "seed_11"}, headers=owner_h)
+    assert retry.status_code == 200
+    assert retry.json()["diffusion_task_id"] != diff_id
+    assert isolated_client.post("/api/tasks/claim", json={"worker_id": "w1", "capabilities": ["rebuild_week2"]}, headers=worker_h).status_code == 204
+    retry_claim = isolated_client.post("/api/tasks/claim", json={"worker_id": "w1", "capabilities": ["diffusion_apply"]}, headers=worker_h).json()
+    assert retry_claim["payload"]["preview_key"] == c2["payload"]["preview_key"]
+    assert retry_claim["payload"]["masks_digest"] == c2["payload"]["masks_digest"]
+    assert isolated_client.get("/api/projects/proj-s21", headers=owner_h).json()["active_version_id"] == "v1"
 
 
 def test_2d_frame_picker_resolve_and_edit_session_transitions(isolated_client: TestClient) -> None:

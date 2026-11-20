@@ -1,3 +1,7 @@
+# Current implementation note — 20 November 2026
+
+The historical report below contains superseded implementation details (including the 8-step default, denylist description and SDXL batch color matching). Use the [current W_7/W_8 verification and recovery report](2026-11-20_week7_week8_verification.md) for the approved exact repository/revision registry, distilled 4-step versus base 50-step presets, real reference-image conditioning, checkpoints and measured verification limits. Historical synthetic timings are not real diffusion throughput or evidence of the required multi-view visual quality.
+
 # Week 2 Diffusion & T4 (`sm_75`) Hardware Report
 
 ## 1. Live Kaggle `2× Tesla T4` Hardware Baseline (`S0.2b-v1`, Verified)

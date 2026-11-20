@@ -8,7 +8,7 @@ import EditStudio from "@/components/EditStudio";
 import { ProgressPanel } from "@/components/ProgressPanel";
 import Viewer3D from "@/components/Viewer3D";
 import { ThemeToggle } from "@/components/ThemeToggle";
-import { API_BASE, roomApi, type Manifest, type ProjectDetail, type TaskSummary, type ViewerController } from "@/lib/api";
+import { API_BASE, AUTH_RESTORED_EVENT, roomApi, type Manifest, type ProjectDetail, type TaskSummary, type ViewerController } from "@/lib/api";
 
 export default function ProjectPage({ params }: { params: Promise<{ id: string }> }) {
   const router = useRouter();
@@ -76,6 +76,14 @@ export default function ProjectPage({ params }: { params: Promise<{ id: string }
   ) ?? project?.tasks.find((t) => t.status === "queued");
   const task: TaskSummary | undefined = activeTask ?? project?.tasks[0];
   const hasActiveTasks = Boolean(activeTask);
+
+  useEffect(() => {
+    const restored = () => { void refresh().then(() => setError("")).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : "Unable to refresh project.");
+    }); };
+    window.addEventListener(AUTH_RESTORED_EVENT, restored);
+    return () => window.removeEventListener(AUTH_RESTORED_EVENT, restored);
+  }, [refresh]);
 
   useEffect(() => {
     if (!projectId) return;

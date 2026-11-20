@@ -375,23 +375,17 @@ def test_sdxl_color_match_samples_moved_reference_mask(tmp_path: Path) -> None:
 
     fake_torch = SimpleNamespace(Generator=_Gen)
     sdxl = _DiffusersSdxlBackend(_FakeSdxlPipe(), fake_torch, DiffusionConfig(model_variant="sdxl_inpaint_t4"), exec_device="cpu")
-    propagate_masked_edits(
-        frame_paths={0: f0, 1: f1},
-        mask_paths={0: m0, 1: m1},
-        ref_frame_idx=0,
-        ref_edited_path=ref_p,
-        prompt="red chair",
-        seed=42,
-        output_dir=tmp_path / "moved_out",
-        backend=sdxl,
-        config=DiffusionConfig(model_variant="sdxl_inpaint_t4", feather_px=0, grid_2x2=False),
-    )
-    tgt_saved = np.asarray(Image.open(tmp_path / "moved_out" / "edited_frames" / "000001.png"))
+    matched = sdxl.inpaint(tgt_orig, tgt_mask, "red chair", seed=42, image_reference=ref_edit, ref_mask=ref_mask)
+    tgt_saved = composite_strict_mask(tgt_orig, matched, tgt_mask, feather_px=0)
     # Bottom-right masked interior should shift to red (ref_mask top-left), not dark green background.
     r_val, g_val, _ = tgt_saved[25, 25]
     assert int(r_val) > int(g_val) + 80
     # Unmasked region stays identically equal to tgt_orig.
     assert np.array_equal(tgt_saved[5, 5], tgt_orig[5, 5])
+    with pytest.raises(StageExecutionError, match="not reference-image conditioning"):
+        propagate_masked_edits({0: f0, 1: f1}, {0: m0, 1: m1}, 0, ref_p,
+                               "red chair", 42, tmp_path / "moved_out", sdxl,
+                               config=DiffusionConfig(device="cpu", grid_2x2=False))
 
 
 def test_t4_quantization_text_encoder_offload_and_vram_telemetry(
@@ -475,7 +469,7 @@ def test_t4_quantization_text_encoder_offload_and_vram_telemetry(
     assert backend_nf4.torch_dtype_name == "float16"
     assert ("model_cpu_offload", 0) in events
     pretrained_kwargs = next(val[1] for name, val in events if name == "from_pretrained")
-    assert pretrained_kwargs["torch_dtype"] == "fp16"
+    assert pretrained_kwargs["dtype"] == "fp16"
     assert isinstance(pretrained_kwargs["quantization_config"], _PipeQuantCfg)
 
     # Test INT8 quanto fallback when bitsandbytes is absent and optimum.quanto is present.

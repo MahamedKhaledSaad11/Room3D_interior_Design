@@ -733,6 +733,11 @@ env = os.environ.copy()
 env["TORCH_CUDA_ARCH_LIST"] = "7.5"
 env["ROOM3D_BACKEND_URL"] = BACKEND_URL
 env["ROOM3D_WORKER_TOKEN"] = WORKER_TOKEN
+env.setdefault("ROOM3D_STAGE_STALL_TIMEOUT_SEC", "900")
+env.setdefault("ROOM3D_DIFFUSION_SETUP_BUDGET_SEC", "1800")
+env.setdefault("ROOM3D_DIFFUSION_STEP_BUDGET_SEC", "30")
+env.setdefault("ROOM3D_DIFFUSION_MAX_BUDGET_SEC", "36000")
+DAEMON_WORK_DIR = os.environ.get("ROOM3D_WORK_DIR", "/kaggle/working/room3d_worker")
 worker_pkg = Path.cwd() / "worker"
 if worker_pkg.exists():
     prev_pp = env.get("PYTHONPATH", "")
@@ -750,6 +755,8 @@ cmd = [
     WORKER_ID,
     "--heartbeat-interval",
     "15",
+    "--work-dir",
+    DAEMON_WORK_DIR,
 ]
 if RUN_DAEMON:
     subprocess.run(cmd, env=env, check=True)

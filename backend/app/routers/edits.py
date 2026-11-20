@@ -23,6 +23,7 @@ from ..schemas import (
     EditFrameItem,
     EditFramesResponse,
     EditSessionOut,
+    EditPreviewSettings,
     MaskUpdateResponse,
     PreviewSeedsRequest,
     RefineRequest,
@@ -163,6 +164,7 @@ def _edit_to_schema(edit: EditSession) -> EditSessionOut:
         created_at=edit.created_at,
         updated_at=edit.updated_at,
         preview_gallery=json.loads(edit.preview_meta_json or "{}").get("preview_gallery", {}),
+        preview_settings=EditPreviewSettings.model_validate_json(edit.preview_meta_json) if edit.preview_meta_json else None,
     )
 
 

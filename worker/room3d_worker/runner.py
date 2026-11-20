@@ -31,9 +31,11 @@ from room3d_worker.common.assets import AssetInfo, AssetRevisionError
 from room3d_worker.common.cancellation import TaskInterruptedError, cancellation_scope
 from room3d_worker.common.errors import StageExecutionError
 from room3d_worker.common.manifest import SceneManifest, load_manifest
-from room3d_worker.common.progress import ProgressEvent, progress_sink, relay_subprocess_progress
+from room3d_worker.common.progress import ProgressEvent, progress_sink, relay_subprocess_progress, report_progress
 from room3d_worker.common.mask_evidence import mask_evidence
 from room3d_worker.common.provenance import runtime_provenance
+from room3d_worker.common.diffusion_checkpoints import CheckpointPublisher
+from room3d_worker.common.stage_budget import positive_setting, stage_budget
 from room3d_worker.pipeline.recolor import diverse_frames, recolor_rgb
 from room3d_worker.common.subprocess_runner import resolve_physical_gpu, run_stage_on_gpu
 from room3d_worker.pipeline.s01_extract import extract_keyframes
@@ -149,6 +151,12 @@ class _StorageAccessor:
         self.cache = DiskAssetCache(cache_root)
         self.validated: set[str] = set()
         self.timings: dict[str, float] = {}
+        self.progress_stage = "01_extract"
+
+    def _download_progress(self, received: int, total: int) -> None:
+        size = f"/{total / 1_000_000:.1f} MB" if total else " MB"
+        report_progress(self.progress_stage, 0, f"Downloading inputs: {received / 1_000_000:.1f}{size}",
+                        phase="input_download", download_bytes=received, download_total_bytes=total)
 
     def _measure(self, label: str, action: Callable[[], T]) -> T:
         started = time.perf_counter()
@@ -179,7 +187,7 @@ class _StorageAccessor:
         for attempt in range(3):
             objects = self._client.bundle_index(prefix, paths)
             try:
-                downloader = partial(self._client.download_bundle, prefix, objects=objects)
+                downloader = partial(self._client.download_bundle, prefix, objects=objects, on_progress=self._download_progress)
                 self.cache.sync(prefix, objects, destination, downloader, paths)
                 self.validated.add(prefix)
                 return objects
@@ -300,6 +308,7 @@ class WorkerRunner:
         poll_interval_sec: float = 0.5,
         heartbeat_interval_sec: float = 15.0,
         stage_timeout_sec: int = 3600,
+        stage_stall_timeout_sec: int | None = None,
         cache_root: Path | None = None,
     ) -> None:
         self.client = client
@@ -317,6 +326,10 @@ class WorkerRunner:
         self.poll_interval_sec = poll_interval_sec
         self.heartbeat_interval_sec = heartbeat_interval_sec
         self.stage_timeout_sec = stage_timeout_sec
+        self.stage_stall_timeout_sec = (positive_setting("ROOM3D_STAGE_STALL_TIMEOUT_SEC", 900)
+                                       if stage_stall_timeout_sec is None else stage_stall_timeout_sec)
+        if stage_timeout_sec <= 0 or self.stage_stall_timeout_sec <= 0:
+            raise ValueError("Stage absolute and stall timeouts must be positive")
         self._frame_cache_dir = self.work_root / "_warm_frames"
         self._frame_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -428,6 +441,7 @@ class WorkerRunner:
         stage = {"reconstruct": "01_extract", "reconstruct_week1": "01_extract", "build_week1": "01_extract",
                  "segment_init": "05_track", "segment_refine": "05_track", "segment_track": "05_track",
                  "track_propagate": "05_track", "rebuild": "07_rebuild", "rebuild_week2": "07_rebuild"}.get(task.task_type, "06_diffusion")
+        self.storage.progress_stage = stage
         self.client.progress(task, stage, 0, "Preparing task inputs")
         started = time.perf_counter()
         result_payload, manifest_key = handler(task)
@@ -448,15 +462,25 @@ class WorkerRunner:
         self.client.progress(task, "04_export" if stage == "01_extract" else stage, 100, "Artifacts uploaded")
         return result_payload, manifest_key
 
-    def _run_isolated(self, stage: str, spec: dict[str, Any], preferred_gpu: int, work_dir: Path) -> dict[str, Any]:
+    def _run_isolated(
+        self, stage: str, spec: dict[str, Any], preferred_gpu: int, work_dir: Path,
+        checkpoint_sync: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         spec_path = work_dir / f"{stage}_spec.json"
         out_path = work_dir / f"{stage}_out.json"
         spec_path.write_text(json.dumps(spec), encoding="utf-8")
-        with relay_subprocess_progress(work_dir / f"{stage}_progress.jsonl") as progress_env:
+        budget = stage_budget(stage, spec, self.stage_timeout_sec, self.stage_stall_timeout_sec)
+        if stage.startswith("diffusion_"):
+            report_progress("06_diffusion", 0, f"Preparing {budget.operations} inference passes; completed checkpoints will be reused",
+                            operations_total=budget.operations, absolute_budget_sec=budget.absolute_sec,
+                            stall_timeout_sec=budget.stall_sec)
+        with relay_subprocess_progress(work_dir / f"{stage}_progress.jsonl", checkpoint_sync) as progress_env:
+            if stage.startswith("diffusion_"):
+                progress_env["ROOM3D_STAGE_PROGRESS_ID"] = "06_diffusion"
             run_stage_on_gpu(
                 [sys.executable, "-m", "room3d_worker.stage_cli", stage, "--spec", str(spec_path), "--out", str(out_path)],
-                preferred_gpu, progress_env, self.stage_timeout_sec,
+                preferred_gpu, progress_env, budget.absolute_sec, stall_timeout_sec=budget.stall_sec,
             )
         self.stage_timings[f"{stage}_subprocess_sec"] = round(time.perf_counter() - started, 4)
         return json.loads(out_path.read_text(encoding="utf-8"))
@@ -465,6 +489,16 @@ class WorkerRunner:
         prefix, name = manifest_key.rsplit("/", 1)
         self.storage.prepare(prefix, [name], dest_dir)
         return load_manifest(dest_dir / name)
+
+    def _diffusion_checkpoints(self, project_id: str, edit_id: str) -> tuple[Path, CheckpointPublisher]:
+        root = self.work_root / "_diffusion_checkpoints" / edit_id
+        downloaded = root.parent / f"{edit_id}_remote"
+        self.storage.prepare(f"{project_id}/edits/{edit_id}", ["diffusion_checkpoints"], downloaded)
+        remote = downloaded / "diffusion_checkpoints"
+        if remote.is_dir():
+            shutil.copytree(remote, root, dirs_exist_ok=True)
+        publisher = CheckpointPublisher(root, f"{project_id}/edits/{edit_id}/diffusion_checkpoints", self.storage.put_many)
+        return root, publisher
 
     def _prepare_scene(self, project_id: str, version_id: str, dest_dir: Path, paths: list[str]) -> SceneManifest:
         self.storage.prepare(f"{project_id}/{version_id}", ["manifest.json", *paths], dest_dir)
@@ -707,6 +741,7 @@ class WorkerRunner:
 
         work_dir = self.work_root / task.task_id
         scene_dir = work_dir / "base"
+        self.client.progress(task, "05_track", 0, "Downloading tracking inputs: images, depth and Gaussian state")
         manifest = self._prepare_scene(project_id, base_version_id, scene_dir, ["images", "depths", "gs_state.npz"])
         image_paths: dict[int, Path] = {}
         for frame in manifest.frames:
@@ -826,6 +861,8 @@ class WorkerRunner:
         variant = payload.get("model_variant") or "flux2_klein_4b"
         negative_prompt = payload.get("negative_prompt")
         self.client.progress(task, "06_diffusion", 0.0, "Generating seed previews")
+        checkpoint_root, sync_checkpoints = self._diffusion_checkpoints(project_id, edit_id)
+        checkpoint_context = {"mask_revision": payload.get("mask_revision"), "masks_digest": payload.get("masks_digest")}
 
         if self.backends.use_isolated_subprocesses and self.backends.inpaint_backend is None:
             out = self._run_isolated(
@@ -840,9 +877,11 @@ class WorkerRunner:
                     "quality_preset": payload.get("quality_preset", "fast"),
                     "output_dir": str(work_dir / "seeds"),
                     "device": "cuda:0",
+                    "checkpoint_root": str(checkpoint_root), "checkpoint_context": checkpoint_context,
                 },
                 0,
                 work_dir,
+                checkpoint_sync=sync_checkpoints,
             )
             generated = out["seeds"]
         else:
@@ -850,7 +889,9 @@ class WorkerRunner:
                                  quality_preset=payload.get("quality_preset", "fast"))
             backend = self.backends.inpaint_backend or load_diffusion_backend(cfg)
             generated = generate_first_frame_seeds(
-                ref_img, ref_mask, str(payload["prompt"]), seeds, work_dir / "seeds", backend, config=cfg
+                ref_img, ref_mask, str(payload["prompt"]), seeds, work_dir / "seeds", backend, config=cfg,
+                checkpoint_root=checkpoint_root, checkpoint_context=checkpoint_context,
+                checkpoint_callback=sync_checkpoints,
             )
 
         preview_seeds: dict[str, str] = {}
@@ -931,6 +972,14 @@ class WorkerRunner:
                     mask_paths[idx] = fetched
             elif mask.is_file():
                 mask_paths[idx] = mask
+            expected = masks_summary.get(str(idx)) or {}
+            if expected.get("skip_frame"):
+                continue
+            if expected.get("area_px", 0) > 0 and idx not in mask_paths:
+                raise StageExecutionError(f"Reviewed mask is missing for frame {idx}; track/review again")
+            if idx in mask_paths and expected.get("content_sha256"):
+                if mask_evidence(mask_paths[idx])["content_sha256"] != expected["content_sha256"]:
+                    raise StageExecutionError(f"Reviewed mask content changed for frame {idx}; track/review again")
 
         preview_key = str(payload["preview_key"])
         ref_edited = self.storage.fetch(preview_key, work_dir / "ref_edited.png")
@@ -939,7 +988,9 @@ class WorkerRunner:
         variant = payload.get("model_variant") or "flux2_klein_4b"
         negative_prompt = payload.get("negative_prompt")
 
-        self.client.progress(task, "06_diffusion", 10.0, "Applying reference-conditioned edits")
+        checkpoint_root, sync_checkpoints = self._diffusion_checkpoints(project_id, edit_id)
+
+        self.client.progress(task, "06_diffusion", 0.0, "Preparing reference-conditioned edits and checkpoints")
         if self.backends.use_isolated_subprocesses and self.backends.inpaint_backend is None:
             metrics = self._run_isolated(
                 "diffusion_apply",
@@ -956,9 +1007,13 @@ class WorkerRunner:
                     "quality_preset": payload.get("quality_preset", "fast"),
                     "output_dir": str(work_dir / "diff_out"),
                     "device": "cuda:0",
+                    "checkpoint_root": str(checkpoint_root),
+                    "checkpoint_context": {"mask_revision": payload.get("mask_revision"),
+                                           "masks_digest": payload.get("masks_digest"), "base_version_id": base_version_id},
                 },
                 0,
                 work_dir,
+                checkpoint_sync=sync_checkpoints,
             )
         else:
             cfg = _diffusion_cfg(variant, negative_prompt, _stage_device(0), grid_2x2=False,
@@ -975,11 +1030,16 @@ class WorkerRunner:
                 backend,
                 skip_frames=skip_frames,
                 config=cfg,
+                checkpoint_root=checkpoint_root,
+                checkpoint_context={"mask_revision": payload.get("mask_revision"),
+                                    "masks_digest": payload.get("masks_digest"), "base_version_id": base_version_id},
+                checkpoint_callback=sync_checkpoints,
             )
+            sync_checkpoints()
 
         edited_dir = work_dir / "diff_out" / "edited_frames"
         self._upload_files(task, "06_diffusion", [
-            (f"{edited_prefix}/{file.name}", file) for file in sorted(edited_dir.glob("*.png"))
+            (f"{edited_prefix}/{idx:06d}.png", edited_dir / f"{idx:06d}.png") for idx in sorted(frame_paths)
         ])
         diffusion_report = work_dir / "diff_out" / "diffusion_metrics.json"
         if diffusion_report.is_file():

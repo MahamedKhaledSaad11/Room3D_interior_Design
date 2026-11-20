@@ -521,7 +521,21 @@ export default function EditStudio({
           setRefFrameIdx(previous.ref_frame_idx ?? 0); setInitialRefFrameIdx(previous.ref_frame_idx ?? 0);
           setPrompt(previous.prompt ?? ""); setPoints([]); setPollingEdit(true);
           setStep(["completed", "candidate", "quality_failed", "validation_pending"].includes(previous.status ?? "") ? 4 : 1);
-          void runAction(() => loadFrames(previous.id));
+          void runAction(async () => {
+            const full = await roomApi.getEdit(projectId, previous.id);
+            if (!full) throw new ApiError(404, "The previous edit is no longer available.");
+            setEditSession(full);
+            const settings = full.preview_settings;
+            setOperation(settings?.operation ?? (full.prompt ? "generative" : "recolor"));
+            setQualityPreset(settings?.quality_preset ?? "fast");
+            setColorHex(settings?.color_hex ?? "#2563eb");
+            setColorStrength(settings?.color_strength ?? 1);
+            setModelVariant(settings?.model_variant ?? "flux2_klein_4b");
+            setNegativePrompt(settings?.negative_prompt ?? "");
+            setChosenSeed(full.chosen_seed_id ?? "seed_101");
+            setPreviewSignature(null);
+            await loadFrames(previous.id);
+          });
         }}><option value="">Choose an edit…</option>{project.edit_sessions.map((entry, index) => <option key={entry.id} value={entry.id}>
           {entry.prompt || `Object edit ${project.edit_sessions.length - index}`} · {entry.status}
         </option>)}</select></label>}
@@ -719,7 +733,15 @@ export default function EditStudio({
             {operation === "recolor" && <><label>Paint color <input aria-label="Paint color" type="color" value={colorHex} onChange={(event) => setColorHex(event.target.value)} /></label>
               <label>Color strength <input aria-label="Color strength" type="range" min="0.05" max="1" step="0.05" value={colorStrength} onChange={(event) => setColorStrength(Number(event.target.value))} /> {Math.round(colorStrength * 100)}%</label>
               <p className="hint-text">Keeps geometry, opacity and luminance detail. Inspect every selected part in each preview before building.</p></>}
-            {operation === "generative" && <p className="hint-text">Generative previews cover one reference image; cross-view consistency is experimental. Shape and asset replacement are unsupported.</p>}
+            {operation === "generative" && <>
+              <p className="hint-text">For a color change, Paint / recolor keeps geometry fixed and uses no diffusion. Generative edits use the approved reference image across views; consistency still needs review.</p>
+              <label>Sampling preset<select aria-label="Sampling preset" value={qualityPreset}
+                onChange={(event) => setQualityPreset(event.target.value as "fast" | "quality")}>
+                <option value="fast">Fast · Distilled 4B · 4 steps</option>
+                <option value="quality">Quality · Base 4B · 50 steps</option>
+              </select></label>
+              <p className="hint-text">{qualityPreset === "quality" ? "Quality runs 50 steps per pass and can take hours across many views. It is not a guarantee of a better room." : "Fast uses the separate distilled checkpoint with 4 steps per pass."} Previews run first, then only nonempty included masks need inference. Live ETA appears after measured progress. Shape and asset replacement are unsupported.</p>
+            </>}
             <label style={{ display: "grid", gap: "4px" }}>
               <span>Edit Prompt</span>
               <input
@@ -754,7 +776,7 @@ export default function EditStudio({
                   onChange={(e) => setModelVariant(e.target.value as DiffusionModelVariant)}
                 >
                   <option value="flux2_klein_4b">FLUX.2 [klein] 4B (Apache-2.0)</option>
-                  <option value="sdxl_inpaint_t4">SDXL Inpaint (T4 Fallback)</option>
+                  <option value="sdxl_inpaint_t4" disabled>SDXL · single-image only · no multi-view reference</option>
                 </select>
               </label>
 
@@ -766,11 +788,6 @@ export default function EditStudio({
                   ))}
                 </select>
               </label>
-              {modelVariant === "flux2_klein_4b" && <label>Sampling preset<select aria-label="Sampling preset" value={qualityPreset}
-                onChange={(event) => setQualityPreset(event.target.value as "fast" | "quality")}>
-                <option value="fast">Distilled 4B · 4 steps · faster</option>
-                <option value="quality">Base 4B · 50 steps · quality experiment</option>
-              </select></label>}
 
               <label>
                 Rebuild Mode:
@@ -809,7 +826,7 @@ export default function EditStudio({
 
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
               <button type="button" className="primary-action" disabled={operationBusy || !masksReviewed || !effectivePrompt} onClick={() => void handlePreviewSeeds()}>
-                {operation === "recolor" ? "Preview paint in diverse views" : "Generate color previews"}
+                {operation === "recolor" ? "Preview paint in diverse views" : "Generate reference edit previews"}
               </button>
               <button type="button" disabled={applyDisabled || recolorNeedsReview} onClick={() => void handleApplyRebuild()}>
                 {operation === "recolor" ? "Build recolor candidate" : "Apply to all views & rebuild room"}

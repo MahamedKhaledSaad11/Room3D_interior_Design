@@ -11,8 +11,8 @@
 [![Tests](https://img.shields.io/badge/Tests-Passing_100%25-success?style=for-the-badge&logo=vitest)](tests)
 
 <p align="center">
-  <b>Turn casual smartphone walkthrough videos into photorealistic, browsable 3D Gaussian rooms.</b><br/>
-  Select, restage, and redesign furniture with generative AI in real time directly inside the browser.
+  <b>Turn smartphone walkthrough videos into browsable 3D Gaussian rooms.</b><br/>
+  Select objects, review masks and reference edits, then build a candidate room from the browser. Generative quality and runtime require scene-specific validation.
 </p>
 
 [Key Features](#-key-features) •
@@ -22,6 +22,8 @@
 [Commercial Guardrails](#-commercial-licensing-guardrails)
 
 </div>
+
+See the [W_7/W_8 verification and diffusion recovery guide](docs/2026-11-20_week7_week8_verification.md) for measured limitations, checkpoint/retry behavior, and backend/frontend/Kaggle restart instructions.
 
 ---
 

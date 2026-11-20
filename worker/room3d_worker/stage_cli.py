@@ -257,6 +257,8 @@ def run_diffusion_preview_stage(spec: dict[str, Any]) -> dict[str, Any]:
         Path(spec["output_dir"]),
         backend,
         config=cfg,
+        checkpoint_root=Path(spec["checkpoint_root"]) if spec.get("checkpoint_root") else None,
+        checkpoint_context=spec.get("checkpoint_context"),
     )
     return {"seeds": seeds}
 
@@ -277,6 +279,8 @@ def run_diffusion_apply_stage(spec: dict[str, Any]) -> dict[str, Any]:
         backend,
         skip_frames={int(i) for i in spec.get("skip_frames", [])},
         config=cfg,
+        checkpoint_root=Path(spec["checkpoint_root"]) if spec.get("checkpoint_root") else None,
+        checkpoint_context=spec.get("checkpoint_context"),
     )
 
 

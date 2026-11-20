@@ -43,9 +43,13 @@ def progress_sink(callback: Callable[[ProgressEvent], None]) -> Iterator[None]:
 
 
 @contextmanager
-def relay_subprocess_progress(path: Path) -> Iterator[dict[str, str]]:
+def relay_subprocess_progress(
+    path: Path, on_poll: Callable[[], None] | None = None,
+) -> Iterator[dict[str, str]]:
     callback = _sink.get()
     path.write_text("", encoding="utf-8")
+    failed_path = path.with_suffix(".relay-error")
+    failed_path.unlink(missing_ok=True)
     stopped = threading.Event()
     errors: list[Exception] = []
 
@@ -62,6 +66,8 @@ def relay_subprocess_progress(path: Path) -> Iterator[dict[str, str]]:
                             break
                         event = ProgressEvent.model_validate_json(line)
                         latest[event.stage] = event
+                    if on_poll:
+                        on_poll()
                     if callback:
                         for event in latest.values():
                             callback(event)
@@ -72,11 +78,12 @@ def relay_subprocess_progress(path: Path) -> Iterator[dict[str, str]]:
                     stopped.wait(1.0)
         except Exception as exc:
             errors.append(exc)
+            failed_path.write_text(str(exc), encoding="utf-8")
 
     thread = threading.Thread(target=relay, name="stage-progress", daemon=True)
     thread.start()
     try:
-        yield {"ROOM3D_PROGRESS_FILE": str(path.resolve())}
+        yield {"ROOM3D_PROGRESS_FILE": str(path.resolve()), "ROOM3D_RELAY_ERROR_FILE": str(failed_path.resolve())}
     finally:
         stopped.set()
         thread.join()

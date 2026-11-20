@@ -268,6 +268,7 @@ class WorkerClient:
 
     def download_bundle(
         self, prefix: str, paths: list[str], destination: Path, objects: list[AssetInfo] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="room3d-download-", dir=destination.parent) as staging:
@@ -275,7 +276,7 @@ class WorkerClient:
             selected = [item for item in objects or [] if any(item.path == path or item.path.startswith(path + "/") for path in paths)]
             headers = {"If-Match": asset_revision(selected)} if objects is not None else {}
             self._download(f"/api/storage/{prefix}/bundle.zip", archive, headers=headers,
-                           params=[("paths", path) for path in paths], timeout=300.0)
+                           params=[("paths", path) for path in paths], timeout=300.0, on_progress=on_progress)
             with ZipFile(archive) as bundle:
                 entries = bundle.infolist()
                 if sum(item.file_size for item in entries) > 8_000_000_000 or len(entries) > 20_000:
@@ -313,7 +314,10 @@ class WorkerClient:
     def download(self, project_id: str, version_id: str, path: str, destination: Path) -> None:
         self._download(f"/api/storage/{project_id}/{version_id}/{path}", destination)
 
-    def _download(self, endpoint: str, destination: Path, **kwargs: Any) -> None:
+    def _download(
+        self, endpoint: str, destination: Path, *, on_progress: Callable[[int, int], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(self._upload_attempts):
             fd, pending = tempfile.mkstemp(prefix=".download-", dir=destination.parent)
@@ -325,8 +329,17 @@ class WorkerClient:
                         raise RetryableWorkerError(f"Storage download temporarily failed with {response.status_code}")
                     if response.status_code >= 400:
                         raise WorkerClientError(f"Storage download failed with {response.status_code}")
+                    received, reported = 0, time.monotonic()
+                    total = int(response.headers.get("content-length", "0"))
                     for chunk in response.iter_bytes():
+                        check_cancelled()
                         output.write(chunk)
+                        received += len(chunk)
+                        if on_progress and time.monotonic() - reported >= 1:
+                            on_progress(received, total)
+                            reported = time.monotonic()
+                    if on_progress:
+                        on_progress(received, total)
                 os.replace(pending, destination)
                 return
             except (httpx.TransportError, RetryableWorkerError) as exc:

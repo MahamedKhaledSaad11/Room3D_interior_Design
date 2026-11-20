@@ -17,7 +17,7 @@ export interface Telemetry { vram_used_mb?: number; vram_total_mb?: number; runt
 export interface SceneVersion { id: string; label: string; parent_version_id: string | null; created_at: string; }
 export interface ProjectDetail extends Project { versions: Array<{ id: string; label: string }>; tasks: TaskSummary[]; edit_sessions: EditSession[]; }
 export interface MaskSummaryEntry { frame_idx: number; mask_key?: string | null; status?: string; skip_frame?: boolean; }
-export interface EditSession { prompt?: string | null; chosen_seed_id?: string | null; id: string; status?: string; base_version_id?: string | null; target_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; preview_gallery?: Record<string, string>; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; mask_revision?: number; }
+export interface EditSession { prompt?: string | null; chosen_seed_id?: string | null; id: string; status?: string; base_version_id?: string | null; target_version_id?: string | null; ref_frame_idx?: number | null; preview_seeds?: Record<string, string>; preview_gallery?: Record<string, string>; preview_settings?: EditOperationOptions & { model_variant?: DiffusionModelVariant; negative_prompt?: string | null }; masks_summary?: MaskSummaryEntry[] | Record<string, unknown>; mask_revision?: number; }
 export interface ResolveClickBody {
   screenX?: number;
   screenY?: number;
@@ -44,6 +44,10 @@ export class ApiError extends Error { constructor(public readonly status: number
 export const API_BASE: string = (typeof process !== "undefined" ? process.env.NEXT_PUBLIC_API_BASE : undefined)?.replace(/\/+$/, "") ?? "";
 const TOKEN_STORAGE_KEY = "room3d.auth_token";
 const assetTokens = new Map<string, string>();
+export const AUTH_STATE_EVENT = "room3d:auth-state";
+export const AUTH_RESTORED_EVENT = "room3d:auth-restored";
+let sessionExpired = false;
+export const isSessionExpired = (): boolean => sessionExpired;
 
 export function getAuthToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -52,9 +56,18 @@ export function getAuthToken(): string | null {
 
 export function setAuthToken(token: string | null): void {
   assetTokens.clear();
+  sessionExpired = false;
   if (typeof window === "undefined") return;
   if (token) window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
   else window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  window.dispatchEvent(new Event(AUTH_STATE_EVENT));
+}
+
+function expireSession(bearer: string | null): void {
+  if (bearer !== getAuthToken() || sessionExpired) return;
+  setAuthToken(null);
+  sessionExpired = true;
+  window.dispatchEvent(new Event(AUTH_STATE_EVENT));
 }
 
 export function appendAuthTokenQuery(url: string): string {
@@ -85,6 +98,8 @@ const asErrorMessage = (body: unknown): string => {
 };
 
 async function request<T>(path: string, token: string | null, init?: RequestInit): Promise<T> {
+  const authentication = /\/api\/auth\/(login|register)$/.test(path);
+  if (sessionExpired && !authentication) throw new ApiError(401, "Session expired. Sign in to resume viewing progress; processing continues.");
   const headers = new Headers(init?.headers);
   if (!(init?.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
@@ -93,6 +108,7 @@ async function request<T>(path: string, token: string | null, init?: RequestInit
   if (bearer) headers.set("Authorization", `Bearer ${bearer}`);
   const response = await fetch(path, { ...init, headers });
   const body: unknown = await response.json().catch(() => undefined);
+  if (response.status === 401 && !authentication && typeof window !== "undefined") expireSession(bearer);
   if (!response.ok) throw new ApiError(response.status, asErrorMessage(body));
   if (typeof body === "object" && body !== null && "id" in body && typeof body.id === "string"
       && "asset_access" in body && typeof body.asset_access === "string") assetTokens.set(body.id, body.asset_access);
@@ -107,9 +123,9 @@ export function validateVideo(file: File, maxBytes = 500 * 1024 * 1024): string 
 }
 
 export class RoomApi {
-  private token: string | null = getAuthToken();
+  private get token(): string | null { return getAuthToken(); }
   constructor(private readonly baseUrl = API_BASE) {}
-  setToken(token: string | null): void { this.token = token; setAuthToken(token); }
+  setToken(token: string | null): void { setAuthToken(token); }
   private path(pathname: string): string { return `${this.baseUrl}${pathname}`; }
   async register(email: string, password: string): Promise<{ access_token: string }> {
     const res = await request<{ access_token: string }>(this.path("/api/auth/register"), this.token, { method: "POST", body: JSON.stringify({ email, password }) });

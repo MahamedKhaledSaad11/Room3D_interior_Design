@@ -1,5 +1,7 @@
 # Room3D edit recovery and verification
 
+For the 20 November one-hour diffusion timeout, current Living room task IDs, checkpoint recovery, restart instructions and the W_7/W_8 requirement matrix, use the [current verification report](2026-11-20_week7_week8_verification.md). The room-specific IDs further below belong to the earlier 19 November audit.
+
 The core repair introduces deterministic paint/recolor, conservative mask evidence and surface membership, reviewable candidate versions, and retained stage timings. It does not establish photorealistic quality or a new dual-T4 runtime benchmark. The original reconstruction defaults remain 960 pixels / 7,000 iterations while a measured reconstruction baseline is developed.
 
 ## Restart locally

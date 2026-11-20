@@ -8,6 +8,7 @@ from pathlib import Path
 
 from room3d_worker.client import WorkerClient
 from room3d_worker.runner import WorkerBackends, WorkerRunner
+from room3d_worker.common.stage_budget import positive_setting
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,6 +28,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--storage-dir", type=Path, default=None, help="Optional shared local storage root")
     parser.add_argument("--poll-interval", type=float, default=0.5, help="Idle poll interval in seconds")
     parser.add_argument("--heartbeat-interval", type=float, default=15.0, help="Heartbeat interval in seconds")
+    parser.add_argument("--stage-timeout-sec", type=int, default=positive_setting("ROOM3D_STAGE_TIMEOUT_SEC", 3600),
+                        help="Absolute budget for non-diffusion stages; diffusion uses workload budgets")
+    parser.add_argument("--stage-stall-timeout-sec", type=int, default=positive_setting("ROOM3D_STAGE_STALL_TIMEOUT_SEC", 900),
+                        help="Stop stages with no subprocess output/progress for this many seconds")
     parser.add_argument(
         "--isolate-stages",
         action=argparse.BooleanOptionalAction,
@@ -36,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="Claim and run at most one task, then exit")
     parser.add_argument("--max-tasks", type=int, default=None, help="Exit after processing N tasks")
     args = parser.parse_args(argv)
+    if args.stage_timeout_sec <= 0 or args.stage_stall_timeout_sec <= 0:
+        parser.error("Stage timeout settings must be positive")
 
     stop = threading.Event()
     warm_thread: threading.Thread | None = None
@@ -75,6 +82,8 @@ def _run(args: argparse.Namespace, stop: threading.Event) -> int:
             backends=WorkerBackends(use_isolated_subprocesses=bool(args.isolate_stages)),
             poll_interval_sec=args.poll_interval,
             heartbeat_interval_sec=args.heartbeat_interval,
+            stage_timeout_sec=args.stage_timeout_sec,
+            stage_stall_timeout_sec=args.stage_stall_timeout_sec,
         )
         if args.once:
             runner.run_once()

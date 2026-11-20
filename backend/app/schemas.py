@@ -59,15 +59,18 @@ class RefineRequest(BaseModel):
     frame_idx: int | None = Field(default=None, ge=0)
 
 
-class PreviewSeedsRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=1000)
+class EditPreviewSettings(BaseModel):
     negative_prompt: str | None = Field(default=None, max_length=1000)
-    seeds: list[int] = Field(default_factory=lambda: [101, 202, 303, 404], min_length=1, max_length=8)
     model_variant: Literal["flux2_klein_4b", "sdxl_inpaint_t4"] = "flux2_klein_4b"
     operation: Literal["recolor", "generative"] = "generative"
     color_hex: str = Field(default="#2563eb", pattern=r"^#[0-9a-fA-F]{6}$")
     color_strength: float = Field(default=1.0, ge=0.05, le=1.0, allow_inf_nan=False)
     quality_preset: Literal["fast", "quality"] = "fast"
+
+
+class PreviewSeedsRequest(EditPreviewSettings):
+    prompt: str = Field(min_length=1, max_length=1000)
+    seeds: list[int] = Field(default_factory=lambda: [101, 202, 303, 404], min_length=1, max_length=8)
 
 
 class ApplyEditRequest(BaseModel):
@@ -148,6 +151,7 @@ class EditSessionOut(BaseModel):
     status: str
     preview_seeds: dict[str, str] = Field(default_factory=dict)
     preview_gallery: dict[str, str] = Field(default_factory=dict)
+    preview_settings: EditPreviewSettings | None = None
     masks_summary: dict[str, Any] = Field(default_factory=dict)
     mask_revision: int = 0
     created_at: datetime | None

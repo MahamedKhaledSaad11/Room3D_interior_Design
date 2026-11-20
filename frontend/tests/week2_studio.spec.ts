@@ -89,7 +89,7 @@ test("live edit masks, manual fallback, four seeds, and rebuilt Before / After",
   await page.getByRole("button", { name: "Continue to color preview" }).click();
   await page.getByLabel("Edit operation").selectOption("generative");
   await page.getByLabel("Edit instruction prompt").fill("emerald velvet chair");
-  await page.getByRole("button", { name: "Generate color previews" }).click();
+  await page.getByRole("button", { name: "Generate reference edit previews" }).click();
   for (const seed of [101, 202, 303, 404]) {
     await expect.poll(() => page.getByTestId(`seed-preview-img-${seed}`).evaluate((image: HTMLImageElement) => image.naturalWidth)).toBe(64);
   }

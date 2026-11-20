@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -60,3 +61,29 @@ def test_native_fatal_survives_interleaved_info_logs_and_long_stack(
     assert "Copying already undistorted" not in message
     assert len("StageExecutionError: " + message) <= 3500
     assert capsys.readouterr().err.endswith(stderr + "\n")
+
+
+def test_live_output_does_not_hit_stall_deadline() -> None:
+    script = "import time\nfor _ in range(8):\n print('step', flush=True)\n time.sleep(.15)"
+    result = run_isolated_stage([sys.executable, "-c", script], None, None, 5, stall_timeout_sec=.6)
+    assert result.stdout.count("step") == 8
+
+
+def test_silent_stage_stalls_even_with_long_absolute_budget() -> None:
+    with pytest.raises(StageExecutionError, match="Stage stalled"):
+        run_isolated_stage([sys.executable, "-c", "import time; time.sleep(10)"], None, None, 20,
+                           stall_timeout_sec=.5)
+
+
+def test_absolute_budget_still_stops_chatty_stage() -> None:
+    script = "import time\nwhile True:\n print('still alive',flush=True)\n time.sleep(.1)"
+    with pytest.raises(StageExecutionError, match="timed out after 1 seconds"):
+        run_isolated_stage([sys.executable, "-c", script], None, None, 1, stall_timeout_sec=.6)
+
+
+def test_progress_file_activity_keeps_silent_stage_alive(tmp_path: Path) -> None:
+    path = tmp_path / "progress.jsonl"
+    script = f"import time\nfrom pathlib import Path\np=Path({str(path)!r})\nfor _ in range(8):\n with p.open('a') as f: f.write('step\\n')\n time.sleep(.15)"
+    run_isolated_stage([sys.executable, "-c", script], None, {"ROOM3D_PROGRESS_FILE": str(path)}, 5,
+                       stall_timeout_sec=.6)
+    assert len(path.read_text().splitlines()) == 8

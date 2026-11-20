@@ -8,10 +8,13 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 from room3d_worker.common.cancellation import cancellation_event, check_cancelled
 from room3d_worker.common.errors import StageExecutionError
+from room3d_worker.common.progress import report_progress
 
 
 @dataclass(frozen=True)
@@ -85,10 +88,13 @@ def _failure_message(context: str, stderr: str) -> str:
 
 
 def run_isolated_stage(
-    cmd: list[str], cuda_device: str | None, env_extra: dict[str, str] | None, timeout_sec: int
+    cmd: list[str], cuda_device: str | None, env_extra: dict[str, str] | None, timeout_sec: int,
+    *, stall_timeout_sec: float | None = None,
 ) -> StageResult:
     if not cmd or timeout_sec <= 0:
         raise StageExecutionError("Stage command must be non-empty and timeout_sec must be positive")
+    if stall_timeout_sec is not None and stall_timeout_sec <= 0:
+        raise StageExecutionError("stall_timeout_sec must be positive")
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
@@ -97,7 +103,7 @@ def run_isolated_stage(
     env["QT_QPA_PLATFORM"] = "offscreen"
     started = time.perf_counter()
     try:
-        result = _run_cancellable(cmd, env, timeout_sec) if cancellation_event() is not None else subprocess.run(
+        result = _run_cancellable(cmd, env, timeout_sec, stall_timeout_sec) if cancellation_event() is not None or stall_timeout_sec is not None else subprocess.run(
             cmd, env=env, check=False, capture_output=True, text=True, timeout=timeout_sec, shell=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -112,7 +118,7 @@ def run_isolated_stage(
     return StageResult(tuple(cmd), result.returncode, elapsed, result.stdout, result.stderr)
 
 
-def _terminate_tree(process: subprocess.Popen[str]) -> None:
+def _terminate_tree(process: subprocess.Popen[bytes]) -> None:
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, check=False)
     else:
@@ -122,22 +128,32 @@ def _terminate_tree(process: subprocess.Popen[str]) -> None:
             return
 
 
-def _run_cancellable(cmd: list[str], env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
+def _run_cancellable(
+    cmd: list[str], env: dict[str, str], timeout: int, stall_timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     check_cancelled()
-    started = time.monotonic()
+    watchdog = _StageWatchdog(env, timeout, stall_timeout)
     process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=os.name != "nt")
+                               start_new_session=os.name != "nt")
+    captured = _StageCapture(process)
     try:
         while True:
             check_cancelled()
-            try:
-                stdout, stderr = process.communicate(timeout=0.25)
-                return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
-            except subprocess.TimeoutExpired:
-                if time.monotonic() - started >= timeout:
-                    _terminate_tree(process)
-                    stdout, stderr = process.communicate()
-                    raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+            watchdog.observe(captured)
+            returncode = process.poll()
+            if returncode is not None and captured.finished():
+                stdout, stderr = captured.text()
+                return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+            if watchdog.expired() or watchdog.stalled():
+                _terminate_tree(process)
+                captured.join()
+                stdout, stderr = captured.text()
+                if watchdog.stalled():
+                    raise StageExecutionError(_failure_message(
+                        f"Stage stalled: no subprocess output or progress for {stall_timeout}s (absolute budget {timeout}s)", stderr,
+                    ))
+                raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+            time.sleep(0.1)
     except BaseException:
         _terminate_tree(process)
         raise
@@ -145,7 +161,104 @@ def _run_cancellable(cmd: list[str], env: dict[str, str], timeout: int) -> subpr
         # A killed Python stage may leave COLMAP/CUDA children holding its output pipes.
         if process.poll() is None:
             _terminate_tree(process)
-        process.communicate()
+        process.wait()
+        captured.join()
+
+
+class _StageWatchdog:
+    def __init__(self, env: dict[str, str], timeout: int, stall_timeout: float | None) -> None:
+        self.env, self.timeout, self.stall_timeout = env, timeout, stall_timeout
+        self.started = self.last_activity = self.last_loading_report = time.monotonic()
+        self.observed = (0, 0, 0)
+        self.loading_finished = False
+        self.progress_path = Path(env["ROOM3D_PROGRESS_FILE"]) if env.get("ROOM3D_PROGRESS_FILE") else None
+
+    def observe(self, captured: _StageCapture) -> None:
+        captured.check_errors()
+        error_file = self.env.get("ROOM3D_RELAY_ERROR_FILE")
+        if error_file and Path(error_file).exists():
+            raise StageExecutionError("Progress/checkpoint relay failed: " + Path(error_file).read_text(encoding="utf-8"))
+        path = self.progress_path
+        file_size = path.stat().st_size if path and path.exists() else 0
+        activity = (*captured.sizes(), file_size)
+        if activity == self.observed:
+            return
+        if file_size != self.observed[2] and path:
+            with path.open("rb") as stream:
+                stream.seek(max(0, file_size - 8192))
+                tail = stream.read()
+            self.loading_finished |= b'"phase":"model_ready"' in tail or b'"denoising_step"' in tail
+        self.last_activity, self.observed = time.monotonic(), activity
+        if not self.loading_finished and self.env.get("ROOM3D_STAGE_PROGRESS_ID") and self.last_activity - self.last_loading_report >= 2:
+            _report_loading(captured.stderr_tail(), self.last_activity - self.started)
+            self.last_loading_report = self.last_activity
+
+    def expired(self) -> bool:
+        return time.monotonic() - self.started >= self.timeout
+
+    def stalled(self) -> bool:
+        return self.stall_timeout is not None and time.monotonic() - self.last_activity >= self.stall_timeout
+
+
+class _StageCapture:
+    """Drain both pipes continuously; Windows communicate() hides partial output until EOF."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self.buffers: list[list[bytes]] = [[], []]
+        self.counts = [0, 0]
+        self.threads: list[threading.Thread] = []
+        self.streams = (process.stdout, process.stderr)
+        self.errors: list[OSError] = []
+        for index, stream in enumerate((process.stdout, process.stderr)):
+            assert stream is not None
+            thread = threading.Thread(target=self._drain, args=(stream.fileno(), index), daemon=True)
+            self.threads.append(thread)
+            thread.start()
+
+    def _drain(self, descriptor: int, index: int) -> None:
+        try:
+            while chunk := os.read(descriptor, 4096):
+                self.buffers[index].append(chunk)
+                self.counts[index] += len(chunk)
+        except OSError as exc:
+            self.errors.append(exc)
+
+    def check_errors(self) -> None:
+        if self.errors:
+            raise StageExecutionError(f"Cannot read subprocess output: {self.errors[0]}") from self.errors[0]
+
+    def sizes(self) -> tuple[int, int]:
+        return self.counts[0], self.counts[1]
+
+    def stderr_tail(self) -> bytes:
+        return b"".join(self.buffers[1][-4:])[-4000:]
+
+    def text(self) -> tuple[str, str]:
+        return (b"".join(self.buffers[0]).decode("utf-8", errors="replace"),
+                b"".join(self.buffers[1]).decode("utf-8", errors="replace"))
+
+    def finished(self) -> bool:
+        return all(not thread.is_alive() for thread in self.threads)
+
+    def join(self) -> None:
+        for thread in self.threads:
+            thread.join()
+        for stream in self.streams:
+            if stream:
+                stream.close()
+
+
+def _report_loading(stderr: bytes | str | None, elapsed: float) -> None:
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr or ""
+    matches = list(re.finditer(r"(Fetching \d+ files|Loading pipeline components|Loading weights)[^\r\n]*", text[-4000:]))
+    if not matches:
+        return
+    phase = matches[-1].group(1)
+    counts = re.search(r"(\d+)/(\d+)", matches[-1].group())
+    measured = f" {counts.group()}" if counts else ""
+    # Only expose measured loader output, never a timer pretending to advance the model.
+    report_progress("06_diffusion", 0, phase + measured + " (loader active)",
+                    phase="download" if phase.startswith("Fetching") else "model_load", elapsed_sec=round(elapsed, 1))
 
 
 def run_stage_on_gpu(
@@ -155,6 +268,7 @@ def run_stage_on_gpu(
     timeout_sec: int,
     *,
     gpu_count: int | None = None,
+    stall_timeout_sec: float | None = None,
 ) -> StageResult:
     """Run an isolated stage subprocess using resolve_physical_gpu; subprocess sees cuda:0."""
     extra = dict(env_extra or {})
@@ -165,4 +279,4 @@ def run_stage_on_gpu(
         if physical is not None:
             cuda_device = str(physical)
             extra["ROOM3D_LOGICAL_CUDA_DEVICE"] = "cuda:0"
-    return run_isolated_stage(cmd, cuda_device, extra, timeout_sec)
+    return run_isolated_stage(cmd, cuda_device, extra, timeout_sec, stall_timeout_sec=stall_timeout_sec)

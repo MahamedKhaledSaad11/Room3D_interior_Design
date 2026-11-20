@@ -11,6 +11,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from collections.abc import Callable
 
 import cv2
 import numpy as np
@@ -18,6 +19,8 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from room3d_worker.common.errors import StageExecutionError
+from room3d_worker.common.diffusion_checkpoints import DiffusionCheckpoints, diffusion_identity
+from room3d_worker.common.generation_progress import GenerationProgress, generation_scope, generation_step
 from room3d_worker.common.progress import report_progress
 
 LOGGER = logging.getLogger(__name__)
@@ -186,6 +189,13 @@ class _DiffusersBackend:
             "strength": self._config.strength,
             "generator": generator,
         }
+        if _supports_pipe_kwarg(self._pipe, "callback_on_step_end", allow_var_kw=False):
+            def step_callback(pipe: Any, step: int, timestep: Any, tensors: dict[str, Any]) -> dict[str, Any]:
+                generation_step(step + 1, int(getattr(pipe, "num_timesteps", self._config.num_inference_steps)))
+                return tensors
+
+            kwargs["callback_on_step_end"] = step_callback
+            kwargs["callback_on_step_end_tensor_inputs"] = []
         # Flux2KleinInpaintPipeline.__call__ omits negative_prompt; only pass if explicitly accepted.
         if negative_prompt and _supports_pipe_kwarg(self._pipe, "negative_prompt", allow_var_kw=not self._supports_ref):
             kwargs["negative_prompt"] = negative_prompt
@@ -197,9 +207,14 @@ class _DiffusersBackend:
             kwargs.pop("strength")
             kwargs.pop("image_reference", None)
             kwargs["height"], kwargs["width"] = image.shape[:2]
-            kwargs["image"] = [Image.fromarray(image)] + ([Image.fromarray(image_reference)] if image_reference is not None else [])
+            kwargs["image"] = [Image.fromarray(image), Image.fromarray(mask).convert("RGB")]
+            instruction = "Image 1 is the current view. Image 2 is its selection mask (white is editable). "
+            if image_reference is not None:
+                kwargs["image"].append(Image.fromarray(image_reference))
+                instruction += "Image 3 is the approved edited reference: match its object appearance in image 1. "
+            kwargs["prompt"] = instruction + "Preserve everything outside the selection. Requested edit: " + prompt
         result = self._pipe(**kwargs).images[0]
-        return np.asarray(result.convert("RGB"), dtype=np.uint8)
+        return np.array(result.convert("RGB"), dtype=np.uint8, copy=True)
 
 
 class _DiffusersFluxKleinBackend(_DiffusersBackend):
@@ -473,6 +488,9 @@ def generate_first_frame_seeds(
     backend: InpaintBackend,
     config: DiffusionConfig | None = None,
     negative_prompt: str | None = None,
+    checkpoint_root: Path | None = None,
+    checkpoint_context: dict[str, object] | None = None,
+    checkpoint_callback: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
     cfg = config or DiffusionConfig()
     neg = cfg.negative_prompt if negative_prompt is None else negative_prompt
@@ -482,23 +500,33 @@ def generate_first_frame_seeds(
     _reset_vram_peak(cfg.device)
     t0 = time.perf_counter()
     previews: list[dict[str, Any]] = []
+    settings = {"mode": "seed_preview", "config": asdict(cfg), "context": checkpoint_context,
+                "prompt": prompt, "negative_prompt": neg, "seeds": seeds,
+                "model": getattr(backend, "resolved_model_id", None), "revision": getattr(backend, "resolved_revision", None),
+                "quantization": getattr(backend, "quantization_mode", cfg.quantization),
+                "dtype": getattr(backend, "torch_dtype_name", "unknown"),
+                "pipeline": type(getattr(backend, "_pipe", backend)).__name__}
+    identity = diffusion_identity({0: ref_image_path}, {0: ref_mask_path}, ref_image_path, settings)
+    checkpoints = DiffusionCheckpoints(checkpoint_root or output_dir / "checkpoints", identity)
+    restored = {seed for seed in seeds if checkpoints.restore(seed, output_dir / f"seed_{seed}.png")}
+    tracker = GenerationProgress(len(seeds), len(seeds), len(restored))
     for seed in seeds:
-        comp = _run_padded_inpaint(
-            orig,
-            mask,
-            prompt,
-            int(seed),
-            backend,
-            cfg.feather_px,
-            negative_prompt=neg,
-        )
         out_path = output_dir / f"seed_{int(seed)}.png"
-        Image.fromarray(comp).save(out_path, format="PNG")
+        if seed not in restored:
+            tracker.begin([int(seed)])
+            with generation_scope(tracker):
+                comp = _run_padded_inpaint(orig, mask, prompt, int(seed), backend, cfg.feather_px, negative_prompt=neg)
+            Image.fromarray(comp).save(out_path, format="PNG")
+            checkpoints.commit(seed, out_path)
+            if checkpoint_callback:
+                checkpoint_callback()
+            tracker.finish()
+        else:
+            assert_unmasked_unchanged(orig, _load_rgb(out_path), mask)
         previews.append({"seed_id": f"seed_{int(seed)}", "seed": int(seed), "path": str(out_path)})
-        report_progress("06_diffusion", 100 * len(previews) / len(seeds),
-                        f"Generated seed preview {len(previews)}/{len(seeds)}", seed=int(seed))
     elapsed = max(time.perf_counter() - t0, 1e-6)
-    sec_per_frame = round(elapsed / max(len(seeds), 1), 4)
+    generated_seeds = len(seeds) - len(restored)
+    sec_per_frame = round(elapsed / generated_seeds, 4) if generated_seeds else None
     peak_vram_mb = _read_peak_vram_mb(cfg.device)
     for item in previews:
         item["sec_per_frame"] = sec_per_frame
@@ -507,6 +535,8 @@ def generate_first_frame_seeds(
         json.dumps(
             {
                 "num_seeds": len(seeds),
+                "seeds_resumed": len(restored),
+                "seeds_generated_this_attempt": generated_seeds,
                 "elapsed_sec": round(elapsed, 4),
                 "sec_per_frame": sec_per_frame,
                 "peak_vram_mb": peak_vram_mb,
@@ -588,8 +618,6 @@ def _propagate_sequential(
             comp = orig
             frame_records[idx] = {"frame_idx": idx, "skipped": True, "method": "unchanged_original", "mask_coverage": 0.0}
         max_diff = max(max_diff, _save_edited_frame(edited_dir, idx, comp, orig, mask))
-        report_progress("06_diffusion", 10 + 85 * len(frame_records) / max(len(frame_paths), 1),
-                        f"Editing frame {len(frame_records)}/{len(frame_paths)}", frame_idx=idx)
     return edited_count, max_diff
 
 
@@ -668,6 +696,9 @@ def propagate_masked_edits(
     skip_frames: set[int] | None = None,
     config: DiffusionConfig | None = None,
     negative_prompt: str | None = None,
+    checkpoint_root: Path | None = None,
+    checkpoint_context: dict[str, object] | None = None,
+    checkpoint_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Propagate an approved reference-frame edit across all active views with strict mask compositing."""
     cfg = config or DiffusionConfig()
@@ -702,54 +733,62 @@ def propagate_masked_edits(
         else:
             inpaint_indices.append(idx)
 
-    inpainted_count = 0
-    if cfg.grid_2x2:
-        for i in range(0, len(inpaint_indices), 4):
-            c, d = _propagate_grid_batch(
-                inpaint_indices[i : i + 4],
-                frame_paths,
-                mask_paths,
-                ref_edit,
-                prompt,
-                seed,
-                edited_dir,
-                backend,
-                cfg.feather_px,
-                frame_records,
-                negative_prompt=neg,
-                ref_mask=ref_mask,
+    settings = {"config": asdict(cfg), "context": checkpoint_context, "prompt": prompt, "negative_prompt": neg, "seed": seed,
+                "ref_frame_idx": ref_frame_idx, "skip_frames": sorted(skipped),
+                "resolved_model": getattr(backend, "resolved_model_id", None),
+                "resolved_revision": getattr(backend, "resolved_revision", None),
+                "pipeline_class": type(getattr(backend, "_pipe", backend)).__name__,
+                "dtype": getattr(backend, "torch_dtype_name", "unknown"),
+                "quantization_mode": getattr(backend, "quantization_mode", cfg.quantization)}
+    identity = diffusion_identity(frame_paths, mask_paths, ref_edited_path, settings)
+    if inpaint_indices and isinstance(backend, _DiffusersSdxlBackend):
+        raise StageExecutionError("SDXL lab color matching is not reference-image conditioning. Use FLUX Klein for multi-view generative edits.")
+    checkpoints = DiffusionCheckpoints(checkpoint_root or output_dir / "checkpoints", identity)
+    groups = _inference_groups(inpaint_indices, frame_paths, cfg.grid_2x2)
+    pending: list[list[int]] = []
+    for group in groups:
+        restored = [checkpoints.restore(idx, edited_dir / f"{idx:06d}.png") for idx in group]
+        if all(restored):
+            for idx in group:
+                orig = _load_rgb(frame_paths[idx])
+                mask = _load_mask(mask_paths[idx], orig.shape[:2])
+                assert_unmasked_unchanged(orig, _load_rgb(edited_dir / f"{idx:06d}.png"), mask)
+                frame_records[idx] = {"frame_idx": idx, "skipped": False, "method": "checkpoint_resume",
+                                      "mask_coverage": _mask_coverage(mask)}
+        else:
+            pending.append(group)
+    resumed = len(groups) - len(pending)
+    tracker = GenerationProgress(len(groups), len(inpaint_indices), resumed)
+    with generation_scope(tracker):
+        for group in pending:
+            tracker.begin(group)
+            _, diff = _propagate_grid_batch(
+                group, frame_paths, mask_paths, ref_edit, prompt, seed, edited_dir, backend,
+                cfg.feather_px, frame_records, negative_prompt=neg, ref_mask=ref_mask,
             )
-            inpainted_count += c
-            max_diff = max(max_diff, d)
-            report_progress("06_diffusion", 10 + 85 * len(frame_records) / max(len(frame_paths), 1),
-                            f"Editing frame {len(frame_records)}/{len(frame_paths)}")
-    else:
-        inpainted_count, d = _propagate_sequential(
-            inpaint_indices,
-            frame_paths,
-            mask_paths,
-            ref_edit,
-            prompt,
-            seed,
-            edited_dir,
-            backend,
-            cfg.feather_px,
-            frame_records,
-            negative_prompt=neg,
-            ref_mask=ref_mask,
-        )
-        max_diff = max(max_diff, d)
+            max_diff = max(max_diff, diff)
+            for idx in group:
+                checkpoints.commit(idx, edited_dir / f"{idx:06d}.png")
+            if checkpoint_callback:
+                checkpoint_callback()
+            tracker.finish()
+    inpainted_count = len(inpaint_indices)
 
     edited_count += inpainted_count
     report_progress("06_diffusion", 95, f"Edited {len(frame_records)}/{len(frame_paths)} frames")
     skipped_count = sum(1 for rec in frame_records.values() if rec["skipped"])
     elapsed = max(time.perf_counter() - t0, 1e-6)
-    sec_per_frame = round(elapsed / max(inpainted_count, 1), 4) if inpainted_count else None
+    generated_count = sum(len(group) for group in pending)
+    sec_per_frame = round(elapsed / generated_count, 4) if generated_count else None
     peak_vram_mb = _read_peak_vram_mb(cfg.device)
     metrics = {
         "ref_frame_idx": ref_frame_idx,
         "frames_edited": edited_count,
         "frames_inpainted": inpainted_count,
+        "frames_generated_this_attempt": generated_count,
+        "frames_resumed": sum(len(group) for group in groups) - sum(len(group) for group in pending),
+        "inference_operations": len(groups), "inference_operations_resumed": resumed,
+        "checkpoint_identity": identity,
         "frames_skipped": skipped_count,
         "grid_2x2": cfg.grid_2x2,
         "max_unmasked_diff": max_diff,
@@ -775,6 +814,24 @@ def propagate_masked_edits(
     }
     (output_dir / "diffusion_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
     return metrics
+
+
+def _inference_groups(indices: list[int], frames: dict[int, Path], use_grid: bool) -> list[list[int]]:
+    if not use_grid:
+        return [[idx] for idx in indices]
+    groups: list[list[int]] = []
+    for start in range(0, len(indices), 4):
+        batch = indices[start:start + 4]
+        sizes = []
+        for idx in batch:
+            with Image.open(frames[idx]) as image:
+                sizes.append(image.size)
+        w, h = sizes[0]
+        if len(batch) == 4 and 4 * w * h <= MAX_GRID_PIXELS and len(set(sizes)) == 1:
+            groups.append(batch)
+        else:
+            groups.extend([idx] for idx in batch)
+    return groups
 
 
 def _resolve_gpu_ordinal(device: str, torch_mod: Any) -> tuple[bool, int]:
@@ -843,7 +900,9 @@ def _from_pretrained_with_quant(
     quant_mode: str = "fp16_offload",
     revision: str | None = None,
 ) -> tuple[Any, str]:
-    kwargs: dict[str, Any] = {"torch_dtype": dtype, "token": hf_token}
+    parameters = inspect.signature(cls.from_pretrained).parameters
+    dtype_key = "torch_dtype" if "torch_dtype" in parameters and "dtype" not in parameters else "dtype"
+    kwargs: dict[str, Any] = {dtype_key: dtype, "token": hf_token}
     revision = revision or APPROVED_MODELS[repo_id]
     if revision:
         kwargs["revision"] = revision
@@ -865,13 +924,15 @@ def _from_pretrained_with_quant(
         if not applied_quant:
             raise
         LOGGER.warning("Quantized from_pretrained(%s) failed (%s); retrying fp16_offload", repo_id, exc)
-        return cls.from_pretrained(repo_id, torch_dtype=dtype, token=hf_token, **({"revision": revision} if revision else {})), "fp16_offload"
+        fallback_kwargs = {key: value for key, value in kwargs.items() if key not in quant_kwargs}
+        return cls.from_pretrained(repo_id, **fallback_kwargs), "fp16_offload"
 
 
 def load_diffusion_backend(config: DiffusionConfig | None = None) -> InpaintBackend:
     """Load T4-safe float16 pipeline with NF4/INT8 quantization and CPU text-encoder offload."""
     cfg = config or DiffusionConfig()
     started = time.perf_counter()
+    report_progress("06_diffusion", 0, f"Loading diffusion model {cfg.model_id}", phase="model_load")
     try:
         torch = importlib.import_module("torch")
         diffusers = importlib.import_module("diffusers")
@@ -940,4 +1001,6 @@ def load_diffusion_backend(config: DiffusionConfig | None = None) -> InpaintBack
     if resolved_repo == cfg.fallback_model_id and cfg.model_variant != "sdxl_inpaint_t4":
         backend._config = replace(cfg, model_variant="sdxl_inpaint_t4", model_revision=None)
     backend.model_load_sec = round(time.perf_counter() - started, 4)
+    report_progress("06_diffusion", 10, f"Model ready: {resolved_repo}", phase="model_ready",
+                    model_load_sec=backend.model_load_sec)
     return backend

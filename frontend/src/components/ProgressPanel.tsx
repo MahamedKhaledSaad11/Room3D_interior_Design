@@ -82,6 +82,12 @@ export function ProgressPanel({ progress, stage, status, message, telemetry, onR
         <span>{message || (done ? "Your scene is ready to explore." : "Processing is running in the background.")}</span>
       </div>
       <div className="telemetry">
+        {telemetry?.operations_total !== undefined && <p>
+          Inference passes: {telemetry.operations_completed ?? 0}/{telemetry.operations_total}
+          {telemetry.frames_to_inpaint !== undefined && <> · {telemetry.frames_to_inpaint} views need diffusion</>}
+          {telemetry.operations_resumed !== undefined && <> · {telemetry.operations_resumed} passes resumed</>}
+        </p>}
+        {!done && !failed && typeof telemetry?.eta_sec === "number" && <p>Estimated inference remaining: {formatRuntime(telemetry.eta_sec)} · updates from measured steps; upload and rebuild follow.</p>}
         <h3>Runtime telemetry</h3>
         <table>
           <tbody>
