@@ -1,5 +1,7 @@
 # W_7 / W_8 verification and diffusion recovery — 20 November 2026
 
+For the subsequent upload interruption, edited-only transfers, verified part resume and current restart sequence, see the [upload repair](2026-11-20_upload_recovery.md).
+
 This review covers [W_7](../W_7.md), [W_8](../W_8.md), and the current repository standard in [AGENTS](../AGENTS.md). Implementation and synthetic tests are evidence of contracts and invariants, not evidence of photorealistic output or a completed dual-T4 benchmark. The older [edit audit](2026-11-19_room_edit_audit.md) concerns a different room and remains useful historical evidence.
 
 ## Confirmed failure and measured workload

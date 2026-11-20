@@ -65,9 +65,24 @@ class DiffusionCheckpoints:
 
 
 class CheckpointPublisher:
-    def __init__(self, root: Path, prefix: str, put_many: Callable[[list[tuple[str, Path]]], None]) -> None:
+    def __init__(
+        self, root: Path, prefix: str, put_many: Callable[[list[tuple[str, Path]]], None],
+        published_root: Path | None = None,
+    ) -> None:
         self.root, self.prefix, self.put_many = root, prefix, put_many
         self.uploaded: dict[Path, str] = {}
+        if published_root:
+            for receipt in published_root.glob("*/*.json"):
+                local = root / receipt.relative_to(published_root)
+                image = receipt.with_suffix(".png")
+                try:
+                    record = json.loads(receipt.read_text(encoding="utf-8"))
+                except ValueError as exc:
+                    logging.getLogger(__name__).warning("Ignoring invalid remote checkpoint receipt %s: %s", receipt, exc)
+                    continue
+                valid = isinstance(record, dict) and image.is_file() and record.get("sha256") == content_digest(image)
+                if valid and local.is_file() and content_digest(local) == content_digest(receipt):
+                    self.uploaded[local] = content_digest(receipt)
 
     def __call__(self) -> None:
         for receipt in self.root.glob("*/*.json"):

@@ -88,6 +88,14 @@ def test_stale_completion_and_progress_persist(api) -> None:
         assert task and task.progress_pct == 7.5
     stale = client.post(f"/api/tasks/{claimed['task_id']}/complete", headers=headers, json={"attempt_id": "stale", "result_payload": {}})
     assert stale.status_code == 409
+    for telemetry in ({"phase": "inference", "eta_sec": 0}, {}):
+        response = client.post(f"/api/tasks/{claimed['task_id']}/progress", headers=headers, json={
+            "attempt_id": claimed["attempt_id"], "stage": "01_extract", "progress_pct": 50, "telemetry": telemetry,
+        })
+        assert response.status_code == 200
+    with session_factory() as session:
+        task = session.get(Task, claimed["task_id"])
+        assert task is not None and json.loads(task.payload_json or "{}")["telemetry"] == {}
 
 
 def test_worker_ownership_conflict_rejected(api) -> None:

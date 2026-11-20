@@ -15,7 +15,8 @@ import pytest
 from PIL import Image
 from fastapi.testclient import TestClient
 from numpy.typing import NDArray
-from room3d_worker.client import WorkerClient, WorkerClientError
+from room3d_worker.client import RetryableWorkerError, WorkerClient, WorkerClientError
+from room3d_worker.common.upload_progress import UploadEvent, upload_progress_sink
 from room3d_worker.common.asset_cache import DiskAssetCache
 from room3d_worker.common.assets import AssetInfo
 from room3d_worker.common.manifest import SceneManifest
@@ -37,7 +38,8 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]
     engine = create_engine(f"sqlite:///{tmp_path / 'uploads.db'}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine)
-    settings = Settings(local_storage_dir=str(tmp_path / "storage"), max_upload_bytes=1)
+    settings = Settings(local_storage_dir=str(tmp_path / "storage"), max_upload_bytes=1,
+                        worker_token="dev-worker-token", auth_required=False)
     for module in ("app.routers.artifact_uploads", "app.routers.scenes", "app.routers.bundles", "app.security",
                    "app.routers.projects", "app.routers.edits", "app.services.queue"):
         monkeypatch.setattr(f"{module}.get_settings", lambda: settings)
@@ -94,6 +96,139 @@ def test_upload_rejects_incomplete_corrupt_and_unsafe_artifacts(api: TestClient)
     assert api.post(f"{root}/complete", json={**body, "path": "../escape"}, headers=headers).status_code == 400
     assert api.post(f"{root}/complete", json=body).status_code == 401
     assert api.get("/api/storage/upload-room/v1/scene.spz").status_code == 404
+
+
+def _forward(api: TestClient, request: httpx.Request) -> httpx.Response:
+    response = api.request(request.method, str(request.url), headers=dict(request.headers), content=request.content)
+    return httpx.Response(response.status_code, content=response.content, headers=dict(response.headers))
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_new_worker_resumes_only_verified_parts(api: TestClient, corrupt: bool) -> None:
+    posts: list[str] = []
+    fail = True
+    endpoint = ""
+
+    def bridge(request: httpx.Request) -> httpx.Response:
+        nonlocal endpoint
+        if request.method == "POST" and "/parts/" in request.url.path:
+            posts.append(request.url.path)
+            endpoint = request.url.path.rsplit("/parts/", 1)[0]
+            if fail and request.url.path.endswith("/parts/1"):
+                raise httpx.WriteTimeout("Connection stalled", request=request)
+        return _forward(api, request)
+
+    payload = np.random.default_rng(2).bytes(9000)
+    with WorkerClient("http://testserver", "dev-worker-token", transport=httpx.MockTransport(bridge),
+                      upload_chunk_bytes=2048, upload_attempts=1, retry_delay=0) as worker:
+        with pytest.raises(RetryableWorkerError, match="acknowledged parts are retained"):
+            worker.upload("upload-room", "v1", "scene.spz", io.BytesIO(payload))
+    headers = {"X-Worker-Token": "dev-worker-token"}
+    if corrupt:
+        assert api.post(f"{endpoint}/parts/0", files={"file": ("part", b"bad")}, headers=headers).status_code == 200
+    status = api.get(f"{endpoint}/status", headers=headers)
+    assert status.headers["cache-control"] == "no-store"
+    assert set(status.json()["parts"]) == {"0"}
+    assert api.get(f"{endpoint}/status").status_code == 401
+    fail = False
+    events: list[UploadEvent] = []
+    with upload_progress_sink(events.append), WorkerClient(
+        "http://testserver", "dev-worker-token", transport=httpx.MockTransport(bridge), upload_chunk_bytes=2048, retry_delay=0,
+    ) as worker:
+        worker.upload("upload-room", "v1", "scene.spz", io.BytesIO(payload))
+    assert sum(path.endswith("/parts/0") for path in posts) == (2 if corrupt else 1)
+    assert events[-1].telemetry["upload_resumed_bytes"] == (0 if corrupt else 2048)
+    assert events[-1].telemetry["upload_confirmed_bytes"] == len(payload)
+    assert api.get("/api/storage/upload-room/v1/scene.spz").content == payload
+
+
+def test_completed_upload_is_not_reused_after_target_was_overwritten(api: TestClient) -> None:
+    posts: list[str] = []
+
+    def bridge(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/parts/" in request.url.path:
+            posts.append(request.url.path)
+        return _forward(api, request)
+
+    with WorkerClient("http://testserver", "dev-worker-token", transport=httpx.MockTransport(bridge),
+                      upload_chunk_bytes=1024, retry_delay=0) as worker:
+        for content in (b"first" * 500, b"second" * 500, b"first" * 500):
+            worker.upload("upload-room", "v1", "scene.spz", io.BytesIO(content))
+            assert api.get("/api/storage/upload-room/v1/scene.spz").content == content
+    assert posts[0] == posts[6], "Returning to old content must restore it, not trust a stale commit receipt"
+
+
+def test_bundle_resume_is_independent_of_file_order_and_mtime(api: TestClient, tmp_path: Path) -> None:
+    import os
+
+    files = [("images/a.png", tmp_path / "a.png"), ("images/b.png", tmp_path / "b.png")]
+    for index, (_, path) in enumerate(files):
+        path.write_bytes(np.random.default_rng(index).bytes(3000))
+    first_parts: list[str] = []
+    fail = True
+
+    def bridge(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/parts/" in request.url.path:
+            if request.url.path.endswith("/parts/0"):
+                first_parts.append(request.url.path)
+            if fail and request.url.path.endswith("/parts/1"):
+                raise httpx.ReadTimeout("Disconnected", request=request)
+        return _forward(api, request)
+
+    with WorkerClient("http://testserver", "dev-worker-token", transport=httpx.MockTransport(bridge),
+                      upload_chunk_bytes=1024, upload_attempts=1, retry_delay=0) as worker:
+        with pytest.raises(RetryableWorkerError):
+            worker.upload_bundle("upload-room/v1", files)
+    fail = False
+    for _, path in files:
+        os.utime(path, (1000000000, 1000000000))
+    with WorkerClient("http://testserver", "dev-worker-token", transport=httpx.MockTransport(bridge),
+                      upload_chunk_bytes=1024, retry_delay=0) as worker:
+        worker.upload_bundle("upload-room/v1", list(reversed(files)))
+    assert len(first_parts) == 1
+    for name, path in files:
+        assert api.get(f"/api/storage/upload-room/v1/{name}").content == path.read_bytes()
+
+
+def test_upload_cancellation_interrupts_retries_and_keeps_partial_bytes(api: TestClient) -> None:
+    import threading
+    from room3d_worker.common.cancellation import TaskInterruptedError, cancellation_scope
+
+    cancelled = threading.Event()
+    posts: list[str] = []
+
+    def bridge(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/parts/1"):
+            posts.append(request.url.path)
+            cancelled.set()
+            raise httpx.WriteTimeout("Stalled", request=request)
+        return _forward(api, request)
+
+    with WorkerClient("http://testserver", "dev-worker-token", transport=httpx.MockTransport(bridge),
+                      upload_chunk_bytes=1024, retry_delay=10) as worker:
+        with cancellation_scope(cancelled), pytest.raises(TaskInterruptedError):
+            worker.upload("upload-room", "v1", "scene.spz", io.BytesIO(b"x" * 3000))
+    assert len(posts) == 1
+    endpoint = posts[0].rsplit("/parts/", 1)[0]
+    status = api.get(f"{endpoint}/status", headers={"X-Worker-Token": "dev-worker-token"}).json()
+    assert status["parts"]["0"]["size"] == 1024
+    assert api.get("/api/storage/upload-room/v1/scene.spz").status_code == 404
+
+
+def test_upload_uses_separate_connection_write_and_read_limits(api: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ROOM3D_UPLOAD_CONNECT_TIMEOUT_SEC", "7")
+    monkeypatch.setenv("ROOM3D_UPLOAD_WRITE_TIMEOUT_SEC", "13")
+    monkeypatch.setenv("ROOM3D_UPLOAD_READ_TIMEOUT_SEC", "23")
+    timeouts: list[dict[str, float]] = []
+
+    def bridge(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return _forward(api, request)
+
+    with WorkerClient("http://testserver", "dev-worker-token", transport=httpx.MockTransport(bridge),
+                      upload_chunk_bytes=1024, retry_delay=0) as worker:
+        worker.upload("upload-room", "v1", "scene.spz", io.BytesIO(b"x" * 3000))
+    assert all(timeout["connect"] == 7 and timeout["write"] == 13 and timeout["read"] == 23 for timeout in timeouts)
 
 
 def test_worker_does_not_retry_permanent_upload_rejections() -> None:

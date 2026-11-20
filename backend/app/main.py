@@ -30,7 +30,7 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     if "/api/storage/" in request.url.path:
-        response.headers["Cache-Control"] = "private, max-age=60"
+        response.headers["Cache-Control"] = "no-store" if "/uploads/" in request.url.path else "private, max-age=60"
     return response
 
 
@@ -58,7 +58,7 @@ async def error_handler(_: Request, exc: Exception) -> JSONResponse:
 app.include_router(auth.router)
 app.include_router(projects.router)
 app.include_router(bundles.router)
-app.include_router(scenes.router)
 app.include_router(artifact_uploads.router)
+app.include_router(scenes.router)
 app.include_router(tasks.router)
 app.include_router(edits.router)

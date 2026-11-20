@@ -526,6 +526,9 @@ def generate_first_frame_seeds(
         previews.append({"seed_id": f"seed_{int(seed)}", "seed": int(seed), "path": str(out_path)})
     elapsed = max(time.perf_counter() - t0, 1e-6)
     generated_seeds = len(seeds) - len(restored)
+    report_progress("06_diffusion", 95, f"Generated {len(seeds)}/{len(seeds)} seed previews",
+                    phase="inference_complete", operations_completed=len(seeds), operations_total=len(seeds),
+                    operations_resumed=len(restored), frames_to_inpaint=len(seeds))
     sec_per_frame = round(elapsed / generated_seeds, 4) if generated_seeds else None
     peak_vram_mb = _read_peak_vram_mb(cfg.device)
     for item in previews:
@@ -775,7 +778,9 @@ def propagate_masked_edits(
     inpainted_count = len(inpaint_indices)
 
     edited_count += inpainted_count
-    report_progress("06_diffusion", 95, f"Edited {len(frame_records)}/{len(frame_paths)} frames")
+    report_progress("06_diffusion", 95, f"Prepared {len(frame_records)}/{len(frame_paths)} frames; inference complete",
+                    phase="inference_complete", operations_completed=len(groups), operations_total=len(groups),
+                    operations_resumed=resumed, frames_to_inpaint=len(inpaint_indices))
     skipped_count = sum(1 for rec in frame_records.values() if rec["skipped"])
     elapsed = max(time.perf_counter() - t0, 1e-6)
     generated_count = sum(len(group) for group in pending)

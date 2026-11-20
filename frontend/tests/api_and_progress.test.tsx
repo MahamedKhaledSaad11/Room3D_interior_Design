@@ -27,6 +27,26 @@ describe("task polling", () => {
 });
 
 describe("progress panel", () => {
+  it("shows acknowledged upload bytes and hides stale inference counters", () => {
+    const { rerender } = render(<ProgressPanel taskType="diffusion_apply" progress={95} stage="06_diffusion" status="running"
+      message="Uploading lossless bundle of 210 artifacts" telemetry={{ operations_completed: 18, operations_total: 19, eta_sec: 0 }} />);
+    expect(screen.getByText("Uploading results")).toBeInTheDocument();
+    expect(screen.queryByText(/Inference passes/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Estimated inference/)).not.toBeInTheDocument();
+    rerender(<ProgressPanel taskType="diffusion_apply" progress={96} stage="06_diffusion" status="running"
+      message="Uploaded 2/5 parts" telemetry={{ phase: "uploading", upload_confirmed_bytes: 2097152,
+        upload_total_bytes: 5242880, upload_parts_completed: 2, upload_parts_total: 5,
+        upload_resumed_bytes: 1048576, upload_speed_bytes_sec: 65536, upload_eta_sec: 48 }} />);
+    expect(screen.getByText("2.0 MiB / 5.0 MiB confirmed")).toBeInTheDocument();
+    expect(screen.getByText(/1.0 MiB reused/)).toBeInTheDocument();
+    expect(screen.getByText(/Estimated upload remaining: 0m 48s/)).toBeInTheDocument();
+    rerender(<ProgressPanel taskType="diffusion_apply" progress={98.5} stage="06_diffusion" status="running"
+      message="All bytes received; verifying and publishing artifacts" telemetry={{ phase: "upload_verifying",
+        upload_confirmed_bytes: 5242880, upload_total_bytes: 5242880, upload_eta_sec: 0 }} />);
+    expect(screen.queryByText(/Estimated upload remaining/)).not.toBeInTheDocument();
+    expect(screen.getByText(/All bytes received; verifying/)).toBeInTheDocument();
+  });
+
   it("updates live diffusion and rebuild task percentages", () => {
     const { rerender } = render(<ProgressPanel taskType="diffusion_apply" progress={10} stage="06_diffusion" status="running" message="Loading edit assets" />);
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "10");

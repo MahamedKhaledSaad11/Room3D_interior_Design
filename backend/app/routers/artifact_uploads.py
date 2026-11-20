@@ -6,7 +6,7 @@ import json
 import tempfile
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -49,6 +49,47 @@ def upload_part(
     if index < 0:
         raise HTTPException(422, "part index must be non-negative")
     return {"bytes": storage.put_stream(f"{prefix}/parts/{index:08d}", file.file)}
+
+
+@router.get("/{project_id}/{scope}/uploads/{upload_id}/status")
+def upload_status(
+    project_id: str, scope: str, upload_id: UUID, part: int | None = Query(default=None, ge=0),
+    session: Session = Depends(get_db),
+) -> dict[str, object]:
+    storage, prefix = _scope(project_id, scope, upload_id, session)
+    parts: dict[str, object] = {}
+    for item in storage.list_objects(f"{prefix}/parts"):
+        name = item.key.rsplit("/", 1)[-1]
+        if len(name) != 8 or not name.isdecimal():
+            continue
+        if part is not None and int(name) != part:
+            continue
+        with storage.open_read(item.key) as stream:
+            digest = hashlib.sha256()
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        parts[str(int(name))] = {"size": item.size, "sha256": digest.hexdigest()}
+    receipt = None
+    if storage.exists(f"{prefix}/receipt.json"):
+        with storage.open_read(f"{prefix}/receipt.json") as stream:
+            candidate = json.load(stream)
+        if _receipt_current(storage, candidate):
+            receipt = candidate
+    return {"parts": parts, "receipt": receipt}
+
+
+def _receipt_current(storage: StorageDriver, receipt: dict[str, object]) -> bool:
+    published = receipt.get("published_objects")
+    if not isinstance(published, list):
+        return True  # Legacy receipts remain valid for old clients finishing in-flight uploads.
+    if not published:
+        return False
+    target = str(receipt["key"])
+    current = storage.list_objects(target)
+    if not current:
+        current = storage.list_objects(target.rsplit("/", 1)[0])
+    objects = {item.key: (item.size, item.etag) for item in current}
+    return all(objects.get(record["key"]) == (record["size"], record["etag"]) for record in published)
 
 
 def _assemble(storage: StorageDriver, prefix: str, target: str, body: CompleteUpload) -> int:
@@ -98,11 +139,21 @@ def complete_upload(
     receipt = {"key": target, "bytes": body.size, "sha256": body.sha256}
     if storage.exists(receipt_key):
         with storage.open_read(receipt_key) as stream:
-            if json.load(stream) != receipt:
+            saved = json.load(stream)
+            if any(saved.get(key) != value for key, value in receipt.items()):
                 raise HTTPException(409, "Upload ID already committed to another artifact")
-        return _result(storage, target, receipt, body.extract_to is not None)
+        if _receipt_current(storage, saved):
+            return _result(storage, target, receipt, body.extract_to is not None)
     _assemble(storage, prefix, target, body)
-    storage.put_stream(receipt_key, io.BytesIO(json.dumps(receipt).encode()))
+    published = (list(bundle_objects(storage, target, []).values()) if body.extract_to is not None else
+                 [item for item in storage.list_objects(target.rsplit("/", 1)[0]) if item.key == target])
+    if not published:
+        raise HTTPException(503, "Uploaded artifact is not visible yet; retry completion with the same upload ID")
+    saved = {**receipt, "published_objects": [
+        {"key": item.key, "size": item.size, "etag": item.etag} for item in published
+        if body.extract_to is not None or item.key == target
+    ]}
+    storage.put_stream(receipt_key, io.BytesIO(json.dumps(saved).encode()))
     storage.delete_prefix(f"{prefix}/parts")
     return _result(storage, target, receipt, body.extract_to is not None)
 

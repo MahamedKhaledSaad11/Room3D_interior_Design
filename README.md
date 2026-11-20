@@ -25,6 +25,8 @@
 
 See the [W_7/W_8 verification and diffusion recovery guide](docs/2026-11-20_week7_week8_verification.md) for measured limitations, checkpoint/retry behavior, and backend/frontend/Kaggle restart instructions.
 
+For interrupted artifact transfers or progress stuck at 95%, use the [upload recovery guide](docs/2026-11-20_upload_recovery.md).
+
 ---
 
 ## 🌟 Overview

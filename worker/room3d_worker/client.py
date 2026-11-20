@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import logging
+import math
 import os
 import shutil
 import stat
@@ -24,6 +27,7 @@ from room3d_worker.common.assets import (
 )
 from room3d_worker.common.cancellation import check_cancelled
 from room3d_worker.common.subprocess_runner import StageResult, run_stage_on_gpu
+from room3d_worker.common.upload_progress import UploadProgress
 
 
 class WorkerClientError(RuntimeError):
@@ -36,6 +40,36 @@ class StaleAttemptError(WorkerClientError):
 
 class RetryableWorkerError(WorkerClientError):
     """A transport interruption or temporary upstream failure can be retried."""
+
+
+def _upload_setting(name: str, default: float) -> float:
+    value = float(os.environ.get(f"ROOM3D_UPLOAD_{name}", str(default)))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"ROOM3D_UPLOAD_{name} must be finite and positive")
+    return value
+
+
+def _retry_wait(delay: float) -> None:
+    end = time.monotonic() + delay
+    while time.monotonic() < end:
+        check_cancelled()
+        time.sleep(min(0.1, max(0, end - time.monotonic())))
+    check_cancelled()
+
+
+def _stream_digest(stream: BinaryIO) -> str:
+    stream.seek(0)
+    digest = hashlib.sha256()
+    while chunk := stream.read(1024 * 1024):
+        check_cancelled()
+        digest.update(chunk)
+    stream.seek(0)
+    return digest.hexdigest()
+
+
+def _part_matches(status: dict[str, Any], index: int, chunk: bytes) -> bool:
+    entry = (status.get("parts") or {}).get(str(index)) or {}
+    return entry.get("size") == len(chunk) and entry.get("sha256") == hashlib.sha256(chunk).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -91,15 +125,21 @@ class WorkerClient:
         *,
         transport: httpx.BaseTransport | None = None,
         timeout: float = 30.0,
-        upload_chunk_bytes: int = 8 * 1024 * 1024,
-        upload_attempts: int = 4,
+        upload_chunk_bytes: int | None = None,
+        upload_attempts: int | None = None,
         retry_delay: float = 1.0,
     ) -> None:
+        upload_chunk_bytes = upload_chunk_bytes if upload_chunk_bytes is not None else int(os.environ.get("ROOM3D_UPLOAD_CHUNK_BYTES", "1048576"))
+        upload_attempts = upload_attempts if upload_attempts is not None else int(os.environ.get("ROOM3D_UPLOAD_ATTEMPTS", "6"))
         if upload_chunk_bytes <= 0 or upload_attempts < 1 or retry_delay < 0:
             raise ValueError("Upload chunk size and attempts must be positive; delay must be non-negative")
         self._upload_chunk_bytes = upload_chunk_bytes
         self._upload_attempts = upload_attempts
         self._retry_delay = retry_delay
+        self._upload_timeout = httpx.Timeout(
+            connect=_upload_setting("CONNECT_TIMEOUT_SEC", 15), read=_upload_setting("READ_TIMEOUT_SEC", 120),
+            write=_upload_setting("WRITE_TIMEOUT_SEC", 60), pool=15,
+        )
         headers = {"X-Worker-Token": worker_token, "Accept": "application/json"}
         self._http = httpx.Client(
             base_url=base_url.rstrip("/"), headers=headers, timeout=timeout, transport=transport
@@ -221,7 +261,7 @@ class WorkerClient:
             handle.seek(0)
             root = f"/api/storage/{project_id}/{version_id}"
             if size <= self._upload_chunk_bytes:
-                return self._retry_post(f"{root}/upload", path, handle)
+                return self._upload_small(f"{root}/upload", path, handle, size)
             return self._upload_chunked(root, path, handle, size)
         finally:
             if isinstance(source, Path):
@@ -229,7 +269,7 @@ class WorkerClient:
 
     def _retry_post(
         self, endpoint: str, filename: str | None = None, stream: BinaryIO | None = None,
-        body: dict[str, object] | None = None, *, timeout: float = 120.0,
+        body: dict[str, object] | None = None, *, timeout: float | httpx.Timeout = 120.0,
     ) -> dict[str, Any]:
         for attempt in range(self._upload_attempts):
             try:
@@ -241,25 +281,71 @@ class WorkerClient:
             except RetryableWorkerError:
                 if attempt + 1 == self._upload_attempts:
                     raise
-                time.sleep(self._retry_delay * 2 ** attempt)
+                _retry_wait(self._retry_delay * 2 ** attempt)
         raise WorkerClientError(f"Request retries exhausted for {endpoint}")
 
     def _upload_chunked(
         self, root: str, path: str, handle: BinaryIO, size: int, *, extract_to: str | None = None,
     ) -> dict[str, Any]:
-        endpoint = f"{root}/uploads/{uuid.uuid4()}"
-        digest = hashlib.sha256()
-        count = 0
-        while chunk := handle.read(self._upload_chunk_bytes):
-            digest.update(chunk)
-            self._retry_post(f"{endpoint}/parts/{count}", "part", io.BytesIO(chunk))
-            count += 1
+        digest = _stream_digest(handle)
+        identity = json.dumps([root, path, extract_to, size, digest, self._upload_chunk_bytes])
+        endpoint = f"{root}/uploads/{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
+        count = (size + self._upload_chunk_bytes - 1) // self._upload_chunk_bytes
         body: dict[str, object] = {
-            "path": path, "part_count": count, "size": size, "sha256": digest.hexdigest(),
+            "path": path, "part_count": count, "size": size, "sha256": digest,
         }
         if extract_to is not None:
             body["extract_to"] = extract_to
-        return self._retry_post(f"{endpoint}/complete", body=body)
+        status = self._upload_status(endpoint)
+        progress = UploadProgress(size, count)
+        confirmed = 0
+        handle.seek(0)
+        for index in range(count):
+            chunk = handle.read(self._upload_chunk_bytes)
+            if status.get("receipt") or _part_matches(status, index, chunk):
+                progress.resumed += len(chunk)
+            else:
+                self._upload_part(endpoint, index, chunk, progress, confirmed)
+            confirmed += len(chunk)
+            progress.report("uploading", confirmed, index + 1, f"Uploaded {index + 1}/{count} parts")
+        progress.report("upload_verifying", confirmed, count, "All bytes received; verifying and publishing artifacts")
+        result = self._retry_post(f"{endpoint}/complete", body=body, timeout=self._upload_timeout)
+        progress.report("upload_complete", confirmed, count, "Artifact upload verified")
+        return result
+
+    def _upload_status(self, endpoint: str, index: int | None = None) -> dict[str, Any]:
+        for attempt in range(self._upload_attempts):
+            try:
+                return self._request("GET", f"{endpoint}/status", timeout=self._upload_timeout,
+                                     params={"part": index} if index is not None else {})
+            except RetryableWorkerError:
+                if attempt + 1 == self._upload_attempts:
+                    raise
+                _retry_wait(self._retry_delay * 2 ** attempt)
+        raise RetryableWorkerError("Upload status retries exhausted")
+
+    def _upload_part(self, endpoint: str, index: int, chunk: bytes, progress: UploadProgress, confirmed: int) -> None:
+        for attempt in range(self._upload_attempts):
+            progress.report("uploading", confirmed, index, f"Sending part {index + 1}/{progress.parts}; waiting for acknowledgement", attempt + 1)
+            try:
+                self._request("POST", f"{endpoint}/parts/{index}", timeout=self._upload_timeout,
+                              files={"file": ("part", io.BytesIO(chunk), "application/octet-stream")})
+                return
+            except RetryableWorkerError as exc:
+                progress.report("upload_retry", confirmed, index, f"Connection interrupted on part {index + 1}; checking received bytes", attempt + 1)
+                if _part_matches(self._upload_status(endpoint, index), index, chunk):
+                    return
+                if attempt + 1 == self._upload_attempts:
+                    raise RetryableWorkerError(f"Part {index + 1}/{progress.parts} failed after {self._upload_attempts} attempts; acknowledged parts are retained") from exc
+                logging.getLogger(__name__).warning("Retrying upload part %s after %s", index, type(exc).__name__)
+                _retry_wait(self._retry_delay * 2 ** attempt)
+
+    def _upload_small(self, endpoint: str, filename: str, handle: BinaryIO, size: int) -> dict[str, Any]:
+        progress = UploadProgress(size, 1)
+        progress.report("uploading", 0, 0, "Sending artifact; waiting for acknowledgement")
+        result = self._retry_post(endpoint, filename, handle, timeout=self._upload_timeout)
+        progress.report("upload_complete", size, 1, "Artifact upload verified")
+        return result
 
     def bundle_index(self, prefix: str, paths: list[str]) -> list[AssetInfo]:
         result = self._request("GET", f"/api/storage/{prefix}/bundle-index",
@@ -297,12 +383,16 @@ class WorkerClient:
             return {"objects": []}
         with cast(BinaryIO, tempfile.TemporaryFile(dir=files[0][1].parent)) as stream:
             with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=1) as archive:
-                for name, path in files:
-                    archive.write(path, safe_asset_path(name))
+                for name, path in sorted(files):
+                    # Stable ZIP metadata keeps upload identities valid across worker restarts.
+                    with path.open("rb") as source, archive.open(safe_asset_path(name), "w", force_zip64=True) as target:
+                        while chunk := source.read(1024 * 1024):
+                            check_cancelled()
+                            target.write(chunk)
             size = stream.tell()
             stream.seek(0)
             if size <= self._upload_chunk_bytes:
-                return self._retry_post(f"/api/storage/{prefix}/upload-bundle", "bundle.zip", stream)
+                return self._upload_small(f"/api/storage/{prefix}/upload-bundle", "bundle.zip", stream, size)
             project, scope, *rest = prefix.split("/")
             return self._upload_chunked(f"/api/storage/{project}/{scope}", "bundle.zip", stream, size,
                                         extract_to="/".join(rest))

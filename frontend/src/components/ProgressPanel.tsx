@@ -28,8 +28,12 @@ export interface ProgressPanelProps {
   uploadMetrics?: Record<string, unknown>;
 }
 
-const formatRuntime = (seconds?: number): string =>
-  seconds === undefined ? "—" : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+const formatRuntime = (seconds?: number): string => {
+  if (seconds === undefined) return "—";
+  const rounded = Math.max(0, Math.ceil(seconds));
+  return `${Math.floor(rounded / 60)}m ${rounded % 60}s`;
+};
+const formatBytes = (bytes: number): string => `${(bytes / 1048576).toFixed(1)} MiB`;
 
 export function ProgressPanel({ progress, stage, status, message, telemetry, onRetry, taskType, metrics, uploadMetrics }: ProgressPanelProps) {
   const failed = status === "failed";
@@ -40,6 +44,8 @@ export function ProgressPanel({ progress, stage, status, message, telemetry, onR
   const doneHeading = stage === "07_rebuild" ? "Candidate built — review required" : !isWeek2 ? "Room ready"
     : taskType === "diffusion_preview" ? "Previews ready" : stage === "05_track" ? "Selection ready" : "Edited views ready";
   const ownStage = isWeek2 && taskType ? WEEK2_STAGES.find((item) => item.id === stage) : undefined;
+  const transfer = ["packaging", "uploading", "upload_retry", "upload_verifying", "upload_complete"].includes(String(telemetry?.phase))
+    || /^(Uploading lossless bundle|Uploaded \d+ artifacts|Packaging \d+ artifacts)/.test(message ?? "");
   const activeStages = ownStage ? [{ ...ownStage, threshold: 100 }] : isWeek2 ? WEEK2_STAGES : WEEK1_STAGES;
   const heading = ownStage?.id === "06_diffusion" ? "Editing your object" : ownStage?.id === "07_rebuild" ? "Rebuilding edited scene" : "Building your room";
 
@@ -48,7 +54,7 @@ export function ProgressPanel({ progress, stage, status, message, telemetry, onR
       <div className="panel-heading">
         <div>
           <p className="eyebrow">{isWeek2 ? "OBJECT EDIT" : "ROOM BUILD"}</p>
-          <h2>{controlHeading ?? (failed ? "Build needs attention" : done ? doneHeading : heading)}</h2>
+          <h2>{controlHeading ?? (failed ? "Build needs attention" : done ? doneHeading : transfer ? "Uploading results" : heading)}</h2>
         </div>
         <strong>{Math.round(progress)}%</strong>
       </div>
@@ -82,12 +88,20 @@ export function ProgressPanel({ progress, stage, status, message, telemetry, onR
         <span>{message || (done ? "Your scene is ready to explore." : "Processing is running in the background.")}</span>
       </div>
       <div className="telemetry">
-        {telemetry?.operations_total !== undefined && <p>
+        {!transfer && telemetry?.operations_total !== undefined && <p>
           Inference passes: {telemetry.operations_completed ?? 0}/{telemetry.operations_total}
           {telemetry.frames_to_inpaint !== undefined && <> · {telemetry.frames_to_inpaint} views need diffusion</>}
           {telemetry.operations_resumed !== undefined && <> · {telemetry.operations_resumed} passes resumed</>}
         </p>}
-        {!done && !failed && typeof telemetry?.eta_sec === "number" && <p>Estimated inference remaining: {formatRuntime(telemetry.eta_sec)} · updates from measured steps; upload and rebuild follow.</p>}
+        {!transfer && telemetry?.phase !== "inference_complete" && !done && !failed && typeof telemetry?.eta_sec === "number" && <p>Estimated inference remaining: {formatRuntime(telemetry.eta_sec)} · updates from measured steps; upload and rebuild follow.</p>}
+        {transfer && typeof telemetry?.upload_total_bytes === "number" && telemetry.upload_total_bytes > 0 && <div aria-label="Upload progress">
+          <p>{formatBytes(Number(telemetry.upload_confirmed_bytes ?? 0))} / {formatBytes(telemetry.upload_total_bytes)} confirmed</p>
+          <p>Parts received: {telemetry.upload_parts_completed ?? 0}/{telemetry.upload_parts_total ?? "—"}
+            {typeof telemetry.upload_resumed_bytes === "number" && telemetry.upload_resumed_bytes > 0 && <> · {formatBytes(telemetry.upload_resumed_bytes)} reused</>}
+          </p>
+          {typeof telemetry.upload_speed_bytes_sec === "number" && telemetry.upload_speed_bytes_sec > 0 && <p>Confirmed upload rate: {(telemetry.upload_speed_bytes_sec / 1024).toFixed(1)} KiB/s</p>}
+          {telemetry.phase === "uploading" && typeof telemetry.upload_eta_sec === "number" && <p>Estimated upload remaining: {formatRuntime(telemetry.upload_eta_sec)} · verification and rebuild follow.</p>}
+        </div>}
         <h3>Runtime telemetry</h3>
         <table>
           <tbody>
@@ -101,7 +115,8 @@ export function ProgressPanel({ progress, stage, status, message, telemetry, onR
             </tr>
             <tr>
               <th>Elapsed</th>
-              <td>{formatRuntime(telemetry?.runtime_seconds)}</td>
+              <td>{formatRuntime(typeof telemetry?.upload_elapsed_sec === "number" ? telemetry.upload_elapsed_sec :
+                typeof telemetry?.elapsed_sec === "number" ? telemetry.elapsed_sec : telemetry?.runtime_seconds)}</td>
             </tr>
             <tr>
               <th>Worker status</th>

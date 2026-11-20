@@ -24,6 +24,7 @@ class GenerationProgress:
         elapsed = time.monotonic() - self.started
         measured_work = self.completed - self.resumed + fraction
         telemetry: dict[str, float | int | str] = {
+            "phase": "inference",
             "operations_completed": self.completed, "operations_total": self.total,
             "frames_to_inpaint": self.frames, "denoising_step": step, "denoising_steps": steps,
             "elapsed_sec": round(elapsed, 1), "operations_resumed": self.resumed,

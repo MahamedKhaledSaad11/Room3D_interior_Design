@@ -35,6 +35,7 @@ from room3d_worker.common.progress import ProgressEvent, progress_sink, relay_su
 from room3d_worker.common.mask_evidence import mask_evidence
 from room3d_worker.common.provenance import runtime_provenance
 from room3d_worker.common.diffusion_checkpoints import CheckpointPublisher
+from room3d_worker.common.upload_progress import UploadEvent, UploadProgress, upload_progress_sink
 from room3d_worker.common.stage_budget import positive_setting, stage_budget
 from room3d_worker.pipeline.recolor import diverse_frames, recolor_rgb
 from room3d_worker.common.subprocess_runner import resolve_physical_gpu, run_stage_on_gpu
@@ -497,7 +498,8 @@ class WorkerRunner:
         remote = downloaded / "diffusion_checkpoints"
         if remote.is_dir():
             shutil.copytree(remote, root, dirs_exist_ok=True)
-        publisher = CheckpointPublisher(root, f"{project_id}/edits/{edit_id}/diffusion_checkpoints", self.storage.put_many)
+        publisher = CheckpointPublisher(root, f"{project_id}/edits/{edit_id}/diffusion_checkpoints", self.storage.put_many,
+                                        published_root=remote)
         return root, publisher
 
     def _prepare_scene(self, project_id: str, version_id: str, dest_dir: Path, paths: list[str]) -> SceneManifest:
@@ -651,12 +653,24 @@ class WorkerRunner:
     def _upload_files(self, task: TaskClaim, stage: str, files: list[tuple[str, Path]]) -> None:
         if not files:
             return
-        self.client.progress(task, stage, 95, f"Uploading lossless bundle of {len(files)} artifacts")
         started = time.perf_counter()
-        self.storage.put_many(files)
+        latest: dict[str, float | int | str] = {}
+
+        def publish(event: UploadEvent) -> None:
+            latest.clear()
+            latest.update(event.telemetry)
+            total = float(event.telemetry.get("upload_total_bytes", 0))
+            confirmed = float(event.telemetry.get("upload_confirmed_bytes", 0))
+            percent = 99 if event.phase == "upload_complete" else 95 + 3.5 * confirmed / max(total, 1)
+            self.client.progress(task, stage, percent, event.message, event.telemetry)
+
+        with upload_progress_sink(publish):
+            UploadProgress(0, 0).report("packaging", 0, 0, f"Packaging {len(files)} artifacts for lossless upload")
+            self.storage.put_many(files)
         elapsed = time.perf_counter() - started
         self.client.progress(task, stage, 99, f"Uploaded {len(files)} artifacts in {elapsed:.1f}s",
-                             {"artifact_upload_sec": round(elapsed, 4), "artifact_bytes": sum(path.stat().st_size for _, path in files)})
+                             {**latest, "phase": "upload_complete", "artifact_upload_sec": round(elapsed, 4),
+                              "artifact_bytes": sum(path.stat().st_size for _, path in files)})
 
     def _upload_scene_bundle(self, task: TaskClaim, project_id: str, version_id: str, scene_dir: Path, manifest: SceneManifest) -> None:
         for required in ("scene.spz", "manifest.json"):
@@ -1038,9 +1052,12 @@ class WorkerRunner:
             sync_checkpoints()
 
         edited_dir = work_dir / "diff_out" / "edited_frames"
+        edited_indices = sorted(int(record["frame_idx"]) for record in metrics["frames"] if not record["skipped"])
         self._upload_files(task, "06_diffusion", [
-            (f"{edited_prefix}/{idx:06d}.png", edited_dir / f"{idx:06d}.png") for idx in sorted(frame_paths)
+            (f"{edited_prefix}/{idx:06d}.png", edited_dir / f"{idx:06d}.png") for idx in edited_indices
         ])
+        metrics["frames_uploaded"] = len(edited_indices)
+        metrics["original_frames_reused"] = len(frame_paths) - len(edited_indices)
         diffusion_report = work_dir / "diff_out" / "diffusion_metrics.json"
         if diffusion_report.is_file():
             self.storage.put(f"{project_id}/edits/{edit_id}/reports/{task.attempt_id}/diffusion_metrics.json", diffusion_report)

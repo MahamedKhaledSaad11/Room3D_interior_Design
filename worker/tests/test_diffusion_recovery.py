@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -73,6 +74,9 @@ def test_partial_failure_resumes_in_new_work_directory(inputs: tuple[dict[int, P
     assert metrics["max_unmasked_diff"] == 0
     assert events[0].percent < 50, "Copied originals must not inflate inference progress"
     assert events[0].telemetry["operations_total"] == 3
+    assert events[-1].telemetry["operations_completed"] == 3
+    assert events[-1].telemetry["phase"] == "inference_complete"
+    assert "eta_sec" not in events[-1].telemetry
     for idx, frame in inputs[0].items():
         original = np.array(Image.open(frame))
         mask = np.array(Image.open(inputs[1][idx]))
@@ -199,6 +203,11 @@ def test_worker_restart_restores_uploaded_checkpoint_without_publishing_partial_
     monkeypatch.setattr("room3d_worker.runner._stage_device", lambda ordinal: "cpu")
     storage = tmp_path / "storage"
     scene, edited, masks = _setup_base_scene(tmp_path / "fixture")
+    saved_manifest = json.loads((scene / "manifest.json").read_text(encoding="utf-8"))
+    saved_manifest["frames"].append({**saved_manifest["frames"][1], "frame_idx": 2,
+                                     "image_relpath": "images/frame_000002.jpg", "colmap_image_id": 3})
+    (scene / "manifest.json").write_text(json.dumps(saved_manifest), encoding="utf-8")
+    shutil.copyfile(scene / "images/frame_000001.jpg", scene / "images/frame_000002.jpg")
     shutil.copytree(scene, storage / "proj-1/v1")
     edit_root = storage / "proj-1/edits/edit1"
     (edit_root / "masks").mkdir(parents=True)
@@ -206,7 +215,8 @@ def test_worker_restart_restores_uploaded_checkpoint_without_publishing_partial_
         shutil.copyfile(masks / f"{idx:05d}.png", edit_root / "masks" / f"{idx:06d}.png")
     shutil.copyfile(edited / "00000.png", edit_root / "preview.png")
     payload = {"edit_id": "edit1", "base_version_id": "v1", "ref_frame_idx": 0,
-               "preview_key": "proj-1/edits/edit1/preview.png", "prompt": "blue", "selected_seed": 5}
+               "preview_key": "proj-1/edits/edit1/preview.png", "prompt": "blue", "selected_seed": 5,
+               "exclude_frames": [2], "masks_summary": {"2": {"skip_frame": True}}}
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
     with WorkerClient("http://testserver", "secret", transport=transport) as client:
         first = WorkerRunner(client, work_root=tmp_path / "worker1", storage_dir=storage,
@@ -229,3 +239,14 @@ def test_worker_restart_restores_uploaded_checkpoint_without_publishing_partial_
     assert backend.calls == 0
     assert manifest is None
     assert len(list((edit_root / "edited_frames").glob("*.png"))) == 2
+    assert result["frames_uploaded"] == 2
+    assert result["original_frames_reused"] == 1
+    assert not (edit_root / "edited_frames/000002.png").exists()
+    from room3d_worker.common.manifest import load_manifest
+    from room3d_worker.pipeline.s07_rebuild import RebuildRequest, _populate_rebuilt_media
+
+    request = RebuildRequest(base_dir=scene, edited_frames_dir=edit_root / "edited_frames",
+                             masks_dir=edit_root / "masks", output_dir=tmp_path / "rebuilt",
+                             project_id="proj-1", version_id="v2", parent_version_id="v1")
+    _populate_rebuilt_media(request, load_manifest(scene / "manifest.json"), {2})
+    assert (request.output_dir / "images/frame_000002.jpg").read_bytes() == (scene / "images/frame_000002.jpg").read_bytes()
